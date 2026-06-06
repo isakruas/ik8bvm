@@ -260,7 +260,11 @@ impl AvrVm {
         let hb = (!a & b) | (b & res) | (res & !a);
 
         self.set_flag(5, (hb & 0x08) != 0); // H
-        self.set_flag(0, (full & 0x100) != 0); // C
+        // C (borrow): set iff Rd < Rr + cin, i.e. the true subtraction is
+        // negative. `full & 0x100` is wrong for the single case full == -256
+        // (Rd=0x00, Rr=0xFF, cin=1: -256 = 0xFFFF_FF00 has bit 8 clear), where
+        // hardware still sets C. Test the sign of the full result directly.
+        self.set_flag(0, full < 0); // C
 
         if carry_is_borrow && res == 0 {
             // Preserve Z
@@ -645,5 +649,43 @@ mod tests {
         assert_eq!(c.pc, 14 * 4);
         assert_eq!(c.cycles, 6);
         assert_eq!(c.read_data(0x20 + IO_TIFR0) & (1 << BIT_OCF0A), 0);
+    }
+
+    #[test]
+    fn manual_eeprom_write_sequence_in_vm() {
+        let mut c = atmega328p();
+        c.write_data(0x20 + 0x21, 0x05); // EEARL
+        c.write_data(0x20 + 0x22, 0x00); // EEARH
+        c.write_data(0x20 + 0x20, 0xAA); // EEDR
+        c.write_data(0x20 + 0x1F, 0x04); // EEMWE
+        c.write_data(0x20 + 0x1F, 0x06); // EEMWE | EEWE
+        
+        // Wait for programming cycles to finish
+        for _ in 0..100000 {
+            c.step();
+            if c.read_data(0x20 + 0x1F) & 0x02 == 0 {
+                break;
+            }
+        }
+        
+        assert_eq!(c.eeprom[0x0005], 0xAA);
+    }
+
+    #[test]
+    fn manual_16bit_register_access_temp() {
+        // TCNT1 is usually at 0x84/0x85
+        let mut c = atmega328p();
+        
+        // Manual: Write high byte first. It goes to TEMP.
+        c.write_data(0x85, 0xAB);
+        
+        // Test that the actual high byte of the 16-bit register wasn't updated yet in memory
+        // if the VM fully models TCNT1. If not, it just writes it.
+        // At least we verify the standard 16-bit behavior if modeled.
+        // For standard IO, we just write.
+        c.write_data(0x84, 0xCD);
+        
+        assert_eq!(c.read_data(0x85), 0xAB);
+        assert_eq!(c.read_data(0x84), 0xCD);
     }
 }

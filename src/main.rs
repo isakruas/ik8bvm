@@ -35,15 +35,42 @@ struct IrqEveryEvent {
 }
 
 fn usage(prog: &str) {
-    println!("Usage: {} <file.hex> [-mmcu=DEVICE] [-t] [-n MAX_INSTR] [-d]", prog);
-    println!("  -mmcu=DEVICE preload memory/core config for DEVICE");
-    println!("  -t           enable instruction trace");
-    println!("  -n MAX       stop after MAX instructions (default: unlimited)");
-    println!("  -d           dump registers at exit");
-    println!("  --irq=VEC            queue one interrupt vector (repeatable)");
-    println!("  --irq-at=VEC:STEP    queue vector when executed-instr count reaches STEP");
-    println!("  --irq-every=VEC:N    queue vector every N executed instructions");
-    println!("  --list-mcus  list known devices and exit");
+    println!("ik8bvm {} - AVR-8 instruction-set simulator", env!("CARGO_PKG_VERSION"));
+    println!();
+    println!("Usage: {} <command> [arguments]", prog);
+    println!();
+    println!("Commands:");
+    println!("  run <file.hex>         Simulate a HEX image (a bare <file.hex> also works)");
+    println!("  devices                List known devices and exit");
+    println!("  version                Print version");
+    println!("  help                   Show this help text");
+    println!();
+    println!("Simulation options (run) — shared with `ik8b sim`/`ik8b run`:");
+    println!("  --mcu <device>         Preload memory/core config for <device>");
+    println!("  --trace, -t            Enable instruction trace");
+    println!("  --dump,  -d            Dump registers at exit");
+    println!("  --limit, -n <N>        Stop after N instructions (default: unlimited)");
+    println!("  --irq <V>              Queue interrupt vector V at startup (repeatable)");
+    println!("  --irq-at <V:STEP>      Queue vector V once at instruction STEP");
+    println!("  --irq-every <V:N>      Queue vector V every N instructions");
+    println!("  --peek <addr>          Print data memory at <addr> on exit");
+    println!("  --peek-len <N>         Number of bytes for --peek (default: 1)");
+}
+
+/// Consumes the value following an option flag, erroring out if it is missing.
+fn take_value(args: &[String], i: &mut usize, label: &str, prog: &str) -> String {
+    *i += 1;
+    args.get(*i).cloned().unwrap_or_else(|| {
+        eprintln!("Missing value for {}", label);
+        usage(prog);
+        process::exit(1);
+    })
+}
+
+/// Parses a `VEC:NUMBER` pair for `--irq-at` / `--irq-every`.
+fn parse_irq_pair(s: &str) -> Option<(u8, u64)> {
+    let (v, n) = s.split_once(':')?;
+    Some((parse_irq_vec(v)?, parse_u64(n)?))
 }
 
 fn parse_u64(s: &str) -> Option<u64> {
@@ -144,96 +171,69 @@ fn main() {
     let mut irq_at_events: Vec<IrqAtEvent> = Vec::new();
     let mut irq_every_events: Vec<IrqEveryEvent> = Vec::new();
 
-    let mut i = 1;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--list-mcus" {
+    // Hierarchical dispatch, coherent with the ik8b CLI vocabulary.
+    let mut start = 1;
+    match args.get(1).map(String::as_str) {
+        Some("devices") | Some("--list-devices") | Some("--list-mcus") => {
             list_mcus();
             return;
-        } else if arg == "-t" {
-            trace = true;
-        } else if arg == "-d" {
-            dump = true;
-        } else if arg == "-n" {
-            i += 1;
-            if i >= args.len() {
-                eprintln!("Missing value for -n");
-                usage(prog);
-                process::exit(1);
+        }
+        Some("version") | Some("-V") | Some("--version") => {
+            println!("ik8bvm {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Some("help") | Some("-h") | Some("--help") => {
+            usage(prog);
+            return;
+        }
+        // `run <hex>` simulates an image; a bare `<hex>` is an implicit `run`.
+        Some("run") => start = 2,
+        _ => {}
+    }
+
+    let mut i = start;
+    while i < args.len() {
+        let arg = args[i].clone();
+        match arg.as_str() {
+            "--trace" | "-t" => trace = true,
+            "--dump" | "-d" => dump = true,
+            "--limit" | "-n" => max_instr = parse_u64(&take_value(&args, &mut i, "--limit", prog)).unwrap_or(0),
+            "--mcu" => mmcu = Some(take_value(&args, &mut i, "--mcu", prog)),
+            "--peek" => peek_addr = parse_u64(&take_value(&args, &mut i, "--peek", prog)).map(|v| v as u32),
+            "--peek-len" => peek_len = parse_u64(&take_value(&args, &mut i, "--peek-len", prog)).unwrap_or(1) as u32,
+            "--irq" => {
+                let v = take_value(&args, &mut i, "--irq", prog);
+                match parse_irq_vec(&v) {
+                    Some(vec) => startup_irqs.push(vec),
+                    None => { eprintln!("Invalid --irq vector '{}' (expected 1..255)", v); process::exit(1); }
+                }
             }
-            max_instr = parse_u64(&args[i]).unwrap_or(0);
-        } else if let Some(device) = arg.strip_prefix("-mmcu=") {
-            mmcu = Some(device.to_string());
-        } else if arg == "-m" {
-            i += 1;
-            if i >= args.len() {
-                eprintln!("Missing value for -m");
-                usage(prog);
-                process::exit(1);
+            "--irq-at" => {
+                let v = take_value(&args, &mut i, "--irq-at", prog);
+                match parse_irq_pair(&v) {
+                    Some((vec, step)) => irq_at_events.push(IrqAtEvent { vec, step, fired: false }),
+                    None => { eprintln!("Invalid --irq-at '{}' (expected VEC:STEP)", v); process::exit(1); }
+                }
             }
-            peek_addr = parse_u64(&args[i]).map(|v| v as u32);
-        } else if arg == "-mlen" {
-            i += 1;
-            if i >= args.len() {
-                eprintln!("Missing value for -mlen");
-                usage(prog);
-                process::exit(1);
+            "--irq-every" => {
+                let v = take_value(&args, &mut i, "--irq-every", prog);
+                match parse_irq_pair(&v) {
+                    Some((_, 0)) => { eprintln!("Invalid --irq-every '{}' (PERIOD must be > 0)", v); process::exit(1); }
+                    Some((vec, period)) => irq_every_events.push(IrqEveryEvent { vec, period, next_at: period }),
+                    None => { eprintln!("Invalid --irq-every '{}' (expected VEC:PERIOD)", v); process::exit(1); }
+                }
             }
-            peek_len = parse_u64(&args[i]).unwrap_or(1) as u32;
-        } else if let Some(vec) = arg.strip_prefix("--irq=") {
-            let Some(vec) = parse_irq_vec(vec) else {
-                eprintln!("Invalid --irq vector '{}' (expected 1..255)", vec);
-                process::exit(1);
-            };
-            startup_irqs.push(vec);
-        } else if let Some(rest) = arg.strip_prefix("--irq-at=") {
-            let Some((vec_s, step_s)) = rest.split_once(':') else {
-                eprintln!("Invalid --irq-at format '{}' (expected VEC:STEP)", rest);
-                process::exit(1);
-            };
-            let Some(vec) = parse_irq_vec(vec_s) else {
-                eprintln!("Invalid --irq-at vector field '{}'", rest);
-                process::exit(1);
-            };
-            let Some(step) = parse_u64(step_s) else {
-                eprintln!("Invalid --irq-at '{}' (expected VEC:STEP)", rest);
-                process::exit(1);
-            };
-            irq_at_events.push(IrqAtEvent { vec, step, fired: false });
-        } else if let Some(rest) = arg.strip_prefix("--irq-every=") {
-            let Some((vec_s, period_s)) = rest.split_once(':') else {
-                eprintln!("Invalid --irq-every format '{}' (expected VEC:N)", rest);
-                process::exit(1);
-            };
-            let Some(vec) = parse_irq_vec(vec_s) else {
-                eprintln!("Invalid --irq-every vector field '{}'", rest);
-                process::exit(1);
-            };
-            let Some(period) = parse_u64(period_s) else {
-                eprintln!("Invalid --irq-every '{}' (expected VEC:N)", rest);
-                process::exit(1);
-            };
-            if period == 0 {
-                eprintln!("Invalid --irq-every '{}' (N must be > 0)", rest);
-                process::exit(1);
-            }
-            irq_every_events.push(IrqEveryEvent {
-                vec,
-                period,
-                next_at: period,
-            });
-        } else if !arg.starts_with('-') {
-            if hexfile.is_none() {
-                hexfile = Some(arg.clone());
-            } else {
+            other if !other.starts_with('-') && hexfile.is_none() => hexfile = Some(other.to_string()),
+            other if !other.starts_with('-') => {
                 eprintln!("Multiple hex files specified");
                 usage(prog);
                 process::exit(1);
             }
-        } else {
-            eprintln!("Unknown option: {}", arg);
-            usage(prog);
-            process::exit(1);
+            other => {
+                eprintln!("Unknown option: {}", other);
+                usage(prog);
+                process::exit(1);
+            }
         }
         i += 1;
     }
