@@ -17,10 +17,11 @@ flags, and instruction cycle counts.
 The decoder implements AVR instruction groups including pointer-based
 loads/stores, the multiply family, program-memory access
 (`LPM`/`ELPM`/`SPM`), indirect jumps/calls, the XMEGA atomic
-read-modify-write instructions, and the XMEGA `DES` round. Unlike the C
-core, ik8bvm additionally models a few peripherals: classic and modern
-EEPROM access, a Timer0 compare-match source, and the ready bits of the
-SPI/TWI/UART status registers (see §3 and §7).
+read-modify-write instructions, and the XMEGA `DES` round. It also models a
+few peripherals: classic and modern EEPROM access, a Timer0 compare-match
+source, and the ready bits of the SPI/TWI/UART status registers (see §3 and §7).
+The SREG (status-flag) semantics of every ALU instruction are checked against
+the AVR Instruction Set Manual by an exhaustive conformance test (see §8).
 
 ### Project layout
 
@@ -54,32 +55,37 @@ cargo build --release   # build the library and the CLI
 cargo test              # run the unit tests
 ```
 
-Run a program:
+The CLI is organised as subcommands:
 
 ```bash
-./target/release/ik8bvm <file.hex> [options]
+./target/release/ik8bvm run <file.hex> --mcu <device> [options]
+./target/release/ik8bvm devices     # list supported device presets
+./target/release/ik8bvm version
+./target/release/ik8bvm help
 ```
+
+A bare `./target/release/ik8bvm <file.hex> [options]` is accepted as a shorthand
+for `run`.
 
 | Option | Effect |
 | :--- | :--- |
-| `-mmcu=DEVICE` | Select a device preset (core class + memory layout). |
-| `--list-mcus` | List all supported MCU presets and exit. |
-| `-t` | Trace: print each instruction (with disassembly) as it executes. |
-| `-n MAX` | Stop after `MAX` instructions (default: run until halt). |
-| `-d` | Dump the register file and SREG at exit. |
-| `-m ADDR` | Read and print one data-space byte at `ADDR` at exit. |
-| `-mlen N` | Read `N` consecutive bytes starting at `-m ADDR`. |
-| `--irq=VEC` | Queue interrupt vector index `VEC` (repeatable; `1..255`). |
-| `--irq-at=VEC:STEP` | Queue vector `VEC` when executed instruction count reaches `STEP`. |
-| `--irq-every=VEC:N` | Queue vector `VEC` every `N` executed instructions. |
+| `--mcu <device>` | Select a device preset (core class + memory layout). |
+| `--trace`, `-t` | Trace: print each instruction (with disassembly) as it executes. |
+| `--limit <N>`, `-n <N>` | Stop after `N` instructions (default: run until halt). |
+| `--dump`, `-d` | Dump the register file and SREG at exit. |
+| `--peek <ADDR>` | Read and print one data-space byte at `ADDR` at exit. |
+| `--peek-len <N>` | Read `N` consecutive bytes starting at `--peek ADDR`. |
+| `--irq <VEC>` | Queue interrupt vector index `VEC` (repeatable; `1..255`). |
+| `--irq-at <VEC:STEP>` | Queue vector `VEC` when executed instruction count reaches `STEP`. |
+| `--irq-every <VEC:N>` | Queue vector `VEC` every `N` executed instructions. |
 
 Example:
 
 ```bash
-./target/release/ik8bvm prog.hex -mmcu=atmega32 -d
-./target/release/ik8bvm prog.hex --list-mcus
-./target/release/ik8bvm prog.hex -mmcu=atmega328p --irq=1 -t
-./target/release/ik8bvm prog.hex -mmcu=atmega328p --irq-at=14:5000 --irq-every=14:10000
+./target/release/ik8bvm run prog.hex --mcu atmega32 --dump
+./target/release/ik8bvm devices
+./target/release/ik8bvm run prog.hex --mcu atmega328p --irq 1 --trace
+./target/release/ik8bvm run prog.hex --mcu atmega328p --irq-at 14:5000 --irq-every 14:10000
 ```
 
 The CLI exit code is `0` on normal completion and `2` if the core halted on
@@ -265,7 +271,11 @@ complete microcontroller:
 
 Unit tests live alongside the sources (`#[cfg(test)]` modules in `core.rs`
 and `decode.rs`). They load opcodes directly into flash, step the core, and
-assert on register, flag, EEPROM, and peripheral state. Run them with:
+assert on register, flag, EEPROM, and peripheral state. In addition,
+`tests/conformance.rs` is an **exhaustive SREG conformance suite**: for every
+flag-affecting ALU instruction it recomputes the expected status bits directly
+from the AVR Instruction Set Manual's boolean formulas and checks them across
+the full operand space. Run them with:
 
 ```bash
 cargo test
