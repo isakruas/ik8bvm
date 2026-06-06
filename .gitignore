@@ -1,0 +1,41 @@
+# Rust build artifacts
+/target/
+
+# ik8b and AVR build outputs
+*.hex
+*.elf
+*.eep
+*.eeprom
+*.lss
+*.lst
+*.map
+*.o
+*.d
+/out/
+/out.hex
+/tests/*.hex
+
+# Benchmark output directories
+/benchmarks/out/
+/benchmarks/reports/
+__pycache__
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+/tmp/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
