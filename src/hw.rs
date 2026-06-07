@@ -1096,7 +1096,7 @@ pub const TWI_HW_TABLE: &[TwiHw] = &[
 ];
 
 pub const UART_HW_TABLE: &[UartHw] = &[
-    UartHw { name: "", data: 0x0, status: 0x0, ctrl: 0x0 },
+    UartHw { name: "atmega32", data: 0x0c, status: 0x0b, ctrl: 0x0a },
 ];
 
 pub fn eeprom_hw(device: &str) -> Option<EepromHw> {
