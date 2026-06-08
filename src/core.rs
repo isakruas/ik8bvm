@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::VecDeque;
+
 use crate::devices::AvrCoreClass;
 use crate::hw;
 
@@ -22,6 +24,34 @@ const IO_OCR0A: u32 = 0x27;
 const IO_TIFR0: u32 = 0x15;
 const IO_TIMSK0: u32 = 0x4E;
 const BIT_OCF0A: u8 = 1;
+
+/// Which on-chip serial peripheral an [`IoEvent`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoPeripheral {
+    Uart,
+    Spi,
+    Twi,
+}
+
+/// What an [`IoEvent`] represents: a data byte, or a TWI bus condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoKind {
+    Data,
+    TwiStart,
+    TwiStop,
+}
+
+/// A captured serial-peripheral access, recorded when `capture_io` is on so a
+/// host (e.g. the IDE breadboard) can show the traffic the program drives.
+#[derive(Debug, Clone, Copy)]
+pub struct IoEvent {
+    pub periph: IoPeripheral,
+    pub kind: IoKind,
+    /// True for a write (MCU transmit); reserved for future read capture.
+    pub write: bool,
+    /// The data byte (meaningful when `kind == Data`).
+    pub byte: u8,
+}
 
 pub struct AvrVm {
     pub r: [u8; 32],
@@ -65,6 +95,30 @@ pub struct AvrVm {
     pub timer0_acc: u32,
     pub timer0_compa_vec: u8,
     pub irq_pending: [bool; 256],
+
+    /// When set, writes to the UART/SPI/TWI data registers are recorded into
+    /// `io_events`. Off by default so normal runs pay nothing.
+    pub capture_io: bool,
+    /// Captured serial-peripheral data-register writes, drained by the host.
+    pub io_events: Vec<IoEvent>,
+    /// Byte the SPI peripheral returns to the master: latched into the SPI data
+    /// register on each SPI data write, so the subsequent read reads it back.
+    /// Host-configurable (defaults to 0xFF, the idle/high-impedance value).
+    pub spi_miso: u8,
+    /// Bytes a host has fed to the USART receiver. RXC reads as set while this
+    /// is non-empty; reading the data register pops the next byte.
+    pub uart_rx: VecDeque<u8>,
+    /// Per-channel ADC inputs (10-bit, 0..1023). A conversion latches the
+    /// selected channel's value into ADCH:ADCL. Host-configurable.
+    pub adc_inputs: [u16; 16],
+    // Cached data-register I/O addresses (io-space) for the active device, so
+    // capture costs a couple of comparisons rather than a table scan per write.
+    uart_data_io: Option<u32>,
+    uart_status_io: Option<u32>,
+    spi_data_io: Option<u32>,
+    twi_data_io: Option<u32>,
+    twi_ctrl_io: Option<u32>,
+    adc: Option<hw::AdcHw>,
 }
 
 impl AvrVm {
@@ -78,6 +132,12 @@ impl AvrVm {
     ) -> Self {
         let io_bytes = sram_start.saturating_sub(0x20);
         let timer0_compa_vec = timer0_compa_vec_for(&device);
+        let uart_data_io = hw::uart_hw(&device).map(|u| u.data);
+        let uart_status_io = hw::uart_hw(&device).map(|u| u.status);
+        let spi_data_io = hw::spi_hw(&device).map(|s| s.data);
+        let twi_data_io = hw::twi_hw(&device).map(|t| t.data);
+        let twi_ctrl_io = hw::twi_hw(&device).map(|t| t.ctrl);
+        let adc = hw::adc_hw(&device);
         Self {
             r: [0; 32],
             pc: 0,
@@ -113,6 +173,29 @@ impl AvrVm {
             timer0_acc: 0,
             timer0_compa_vec,
             irq_pending: [false; 256],
+            capture_io: false,
+            io_events: Vec::new(),
+            spi_miso: 0xFF,
+            uart_rx: VecDeque::new(),
+            adc_inputs: [0; 16],
+            uart_data_io,
+            uart_status_io,
+            spi_data_io,
+            twi_data_io,
+            twi_ctrl_io,
+            adc,
+        }
+    }
+
+    /// Queue bytes for the USART receiver (host -> MCU).
+    pub fn uart_feed(&mut self, bytes: &[u8]) {
+        self.uart_rx.extend(bytes.iter().copied());
+    }
+
+    /// Set the analog value (0..1023) presented on ADC `channel`.
+    pub fn adc_set(&mut self, channel: usize, value: u16) {
+        if channel < self.adc_inputs.len() {
+            self.adc_inputs[channel] = value.min(0x3FF);
         }
     }
 
@@ -140,7 +223,7 @@ impl AvrVm {
         self.trace_buf.push(line);
     }
 
-    pub fn read_data(&self, addr: u32) -> u8 {
+    pub fn read_data(&mut self, addr: u32) -> u8 {
         if addr < 32 {
             self.r[addr as usize]
         } else if self.core != AvrCoreClass::RC && addr == 0x5F {
@@ -173,9 +256,15 @@ impl AvrVm {
                 }
             }
 
-            if let Some(uart) = hw::uart_hw(&self.device) {
-                if io_addr == uart.status {
-                    return self.io_read_raw(io_addr) | 0x60;
+            // USART status: UDRE/TXC always ready; RXC set while bytes wait.
+            if Some(io_addr) == self.uart_status_io {
+                let rxc = if self.uart_rx.is_empty() { 0 } else { 0x80 };
+                return self.io_read_raw(io_addr) | 0x60 | rxc;
+            }
+            // USART data: a read consumes the next received byte.
+            if Some(io_addr) == self.uart_data_io {
+                if let Some(b) = self.uart_rx.pop_front() {
+                    return b;
                 }
             }
 
@@ -219,6 +308,47 @@ impl AvrVm {
                     self.eeprom_handle_eecr_write(old, v, ee);
                 } else if ee.is_modern && io_addr == ee.ctrl {
                     self.eeprom_handle_modern_write(v, ee);
+                }
+            }
+
+            // Capture serial-peripheral transmissions for a watching host.
+            if self.capture_io {
+                if Some(io_addr) == self.uart_data_io {
+                    self.io_events.push(IoEvent { periph: IoPeripheral::Uart, kind: IoKind::Data, write: true, byte: v });
+                } else if Some(io_addr) == self.spi_data_io {
+                    self.io_events.push(IoEvent { periph: IoPeripheral::Spi, kind: IoKind::Data, write: true, byte: v });
+                    // Present the configured MISO response for the master's read-back.
+                    self.io_write_raw(io_addr, self.spi_miso);
+                } else if Some(io_addr) == self.twi_data_io {
+                    self.io_events.push(IoEvent { periph: IoPeripheral::Twi, kind: IoKind::Data, write: true, byte: v });
+                } else if Some(io_addr) == self.twi_ctrl_io {
+                    // TWCR: TWSTA (0x20) requests a START, TWSTO (0x10) a STOP.
+                    if v & 0x20 != 0 {
+                        self.io_events.push(IoEvent { periph: IoPeripheral::Twi, kind: IoKind::TwiStart, write: true, byte: 0 });
+                    }
+                    if v & 0x10 != 0 {
+                        self.io_events.push(IoEvent { periph: IoPeripheral::Twi, kind: IoKind::TwiStop, write: true, byte: 0 });
+                    }
+                }
+            }
+
+            // ADC: writing ADCSRA with ADEN+ADSC set performs a conversion of the
+            // ADMUX-selected channel from the host-supplied input, then clears
+            // ADSC so a polling loop sees the conversion complete.
+            if let Some(adc) = self.adc {
+                if io_addr == adc.ctrl && v & 0x80 != 0 && v & 0x40 != 0 {
+                    let mux = self.io_read_raw(adc.mux);
+                    let channel = (mux & 0x0F) as usize;
+                    let value = self.adc_inputs.get(channel).copied().unwrap_or(0) & 0x3FF;
+                    if mux & 0x20 != 0 {
+                        // ADLAR: left-adjusted result.
+                        self.io_write_raw(adc.datah, (value >> 2) as u8);
+                        self.io_write_raw(adc.datal, ((value << 6) & 0xC0) as u8);
+                    } else {
+                        self.io_write_raw(adc.datal, (value & 0xFF) as u8);
+                        self.io_write_raw(adc.datah, ((value >> 8) & 0x03) as u8);
+                    }
+                    self.io_write_raw(adc.ctrl, v & !0x40); // clear ADSC
                 }
             }
         } else if addr < self.sram_start + self.sram_bytes {
