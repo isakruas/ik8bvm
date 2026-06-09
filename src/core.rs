@@ -47,10 +47,46 @@ pub enum IoKind {
 pub struct IoEvent {
     pub periph: IoPeripheral,
     pub kind: IoKind,
-    /// True for a write (MCU transmit); reserved for future read capture.
+    /// True for a write (MCU transmit); false for a byte read back from a device.
     pub write: bool,
     /// The data byte (meaningful when `kind == Data`).
     pub byte: u8,
+}
+
+/// Implemented by a host to model external devices that respond to the MCU's
+/// serial buses *synchronously* (within the instruction that drives them). The
+/// VM calls these at the matching bus events; the host routes to the connected
+/// device(s). All methods have inert defaults so a responder need only model
+/// the buses it cares about.
+pub trait BusResponder: Send {
+    /// SPI full-duplex: the MCU clocked out `mosi`; return the byte shifted in.
+    fn spi_transfer(&mut self, _mosi: u8) -> u8 {
+        0xFF
+    }
+    /// I2C START issued by the master.
+    fn i2c_start(&mut self) {}
+    /// I2C address byte (7-bit `addr` + `read` direction). Return true to ACK.
+    fn i2c_address(&mut self, _addr: u8, _read: bool) -> bool {
+        false
+    }
+    /// I2C: master wrote a data byte. Return true to ACK.
+    fn i2c_write(&mut self, _byte: u8) -> bool {
+        false
+    }
+    /// I2C: master reads a byte; `last` is true when it will NACK (final byte).
+    fn i2c_read(&mut self, _last: bool) -> u8 {
+        0xFF
+    }
+    /// I2C STOP issued by the master.
+    fn i2c_stop(&mut self) {}
+    /// UART: the MCU transmitted a byte to the device.
+    fn uart_tx(&mut self, _byte: u8) {}
+    /// UART: pull the next byte the device wants to send to the MCU, if any.
+    fn uart_poll(&mut self) -> Option<u8> {
+        None
+    }
+    /// Advance device time by `cycles`, for autonomous behaviour.
+    fn tick(&mut self, _cycles: u64) {}
 }
 
 pub struct AvrVm {
@@ -111,6 +147,12 @@ pub struct AvrVm {
     /// Per-channel ADC inputs (10-bit, 0..1023). A conversion latches the
     /// selected channel's value into ADCH:ADCL. Host-configurable.
     pub adc_inputs: [u16; 16],
+    /// Optional model of the external devices on the serial buses. When set, the
+    /// VM routes SPI/I2C/UART traffic through it for synchronous responses.
+    pub responder: Option<Box<dyn BusResponder>>,
+    // TWI master decode state (classic AVR), advanced by TWCR/TWDR writes.
+    twi_expect_addr: bool,
+    twi_twdr_written: bool,
     // Cached data-register I/O addresses (io-space) for the active device, so
     // capture costs a couple of comparisons rather than a table scan per write.
     uart_data_io: Option<u32>,
@@ -178,6 +220,9 @@ impl AvrVm {
             spi_miso: 0xFF,
             uart_rx: VecDeque::new(),
             adc_inputs: [0; 16],
+            responder: None,
+            twi_expect_addr: false,
+            twi_twdr_written: false,
             uart_data_io,
             uart_status_io,
             spi_data_io,
@@ -196,6 +241,112 @@ impl AvrVm {
     pub fn adc_set(&mut self, channel: usize, value: u16) {
         if channel < self.adc_inputs.len() {
             self.adc_inputs[channel] = value.min(0x3FF);
+        }
+    }
+
+    /// Advance attached devices and drain any UART bytes they wish to send to
+    /// the MCU into the receive FIFO. Called once per host frame.
+    pub fn poll_devices(&mut self, cycles: u64) {
+        let mut fed: Vec<u8> = Vec::new();
+        if let Some(r) = self.responder.as_mut() {
+            r.tick(cycles);
+            // Bounded drain so a chatty device can't starve the loop.
+            for _ in 0..256 {
+                match r.uart_poll() {
+                    Some(b) => fed.push(b),
+                    None => break,
+                }
+            }
+        }
+        self.uart_rx.extend(fed);
+    }
+
+    /// Capture a serial-peripheral write for the host monitor and route it
+    /// through the attached device model. The TWI data register only stages a
+    /// byte; it is transmitted when TWCR is written (see `handle_twcr_write`).
+    fn handle_serial_write(&mut self, io_addr: u32, v: u8) {
+        let cap = self.capture_io;
+        if Some(io_addr) == self.uart_data_io {
+            if cap {
+                self.io_events.push(IoEvent { periph: IoPeripheral::Uart, kind: IoKind::Data, write: true, byte: v });
+            }
+            if let Some(r) = self.responder.as_mut() {
+                r.uart_tx(v);
+            }
+        } else if Some(io_addr) == self.spi_data_io {
+            if cap {
+                self.io_events.push(IoEvent { periph: IoPeripheral::Spi, kind: IoKind::Data, write: true, byte: v });
+            }
+            let miso = match self.responder.as_mut() {
+                Some(r) => r.spi_transfer(v),
+                None => self.spi_miso,
+            };
+            self.io_write_raw(io_addr, miso);
+        } else if Some(io_addr) == self.twi_data_io {
+            // Stage the byte; it is sent when the program writes TWCR.
+            self.twi_twdr_written = true;
+        } else if Some(io_addr) == self.twi_ctrl_io {
+            self.handle_twcr_write(v);
+        }
+    }
+
+    /// Decode a classic-AVR TWCR write into a TWI bus action. The std master
+    /// only polls TWINT (faked always-ready in `read_data`), never the TWSR
+    /// status codes, so reproducing the START/address/data/read *sequence* is
+    /// enough to drive a device model.
+    fn handle_twcr_write(&mut self, v: u8) {
+        const TWEA: u8 = 0x40; // ACK enable (more bytes to read)
+        const TWSTA: u8 = 0x20; // START
+        const TWSTO: u8 = 0x10; // STOP
+        let cap = self.capture_io;
+
+        if v & TWSTA != 0 {
+            if cap {
+                self.io_events.push(IoEvent { periph: IoPeripheral::Twi, kind: IoKind::TwiStart, write: true, byte: 0 });
+            }
+            if let Some(r) = self.responder.as_mut() {
+                r.i2c_start();
+            }
+            self.twi_expect_addr = true;
+            self.twi_twdr_written = false;
+        } else if v & TWSTO != 0 {
+            if cap {
+                self.io_events.push(IoEvent { periph: IoPeripheral::Twi, kind: IoKind::TwiStop, write: true, byte: 0 });
+            }
+            if let Some(r) = self.responder.as_mut() {
+                r.i2c_stop();
+            }
+            self.twi_twdr_written = false;
+        } else if self.twi_twdr_written {
+            // Transmit the staged TWDR byte: the first after START is the
+            // address (+ R/W bit), the rest are data.
+            let byte = self.twi_data_io.map(|a| self.io_read_raw(a)).unwrap_or(0);
+            if cap {
+                self.io_events.push(IoEvent { periph: IoPeripheral::Twi, kind: IoKind::Data, write: true, byte });
+            }
+            if self.twi_expect_addr {
+                let read = byte & 1 != 0;
+                if let Some(r) = self.responder.as_mut() {
+                    r.i2c_address(byte >> 1, read);
+                }
+                self.twi_expect_addr = false;
+            } else if let Some(r) = self.responder.as_mut() {
+                r.i2c_write(byte);
+            }
+            self.twi_twdr_written = false;
+        } else {
+            // Master read: ACK (TWEA) means more bytes follow; NACK is the last.
+            let last = v & TWEA == 0;
+            let b = match self.responder.as_mut() {
+                Some(r) => r.i2c_read(last),
+                None => self.twi_data_io.map(|a| self.io_read_raw(a)).unwrap_or(0),
+            };
+            if let Some(a) = self.twi_data_io {
+                self.io_write_raw(a, b);
+            }
+            if cap {
+                self.io_events.push(IoEvent { periph: IoPeripheral::Twi, kind: IoKind::Data, write: false, byte: b });
+            }
         }
     }
 
@@ -311,25 +462,11 @@ impl AvrVm {
                 }
             }
 
-            // Capture serial-peripheral transmissions for a watching host.
-            if self.capture_io {
-                if Some(io_addr) == self.uart_data_io {
-                    self.io_events.push(IoEvent { periph: IoPeripheral::Uart, kind: IoKind::Data, write: true, byte: v });
-                } else if Some(io_addr) == self.spi_data_io {
-                    self.io_events.push(IoEvent { periph: IoPeripheral::Spi, kind: IoKind::Data, write: true, byte: v });
-                    // Present the configured MISO response for the master's read-back.
-                    self.io_write_raw(io_addr, self.spi_miso);
-                } else if Some(io_addr) == self.twi_data_io {
-                    self.io_events.push(IoEvent { periph: IoPeripheral::Twi, kind: IoKind::Data, write: true, byte: v });
-                } else if Some(io_addr) == self.twi_ctrl_io {
-                    // TWCR: TWSTA (0x20) requests a START, TWSTO (0x10) a STOP.
-                    if v & 0x20 != 0 {
-                        self.io_events.push(IoEvent { periph: IoPeripheral::Twi, kind: IoKind::TwiStart, write: true, byte: 0 });
-                    }
-                    if v & 0x10 != 0 {
-                        self.io_events.push(IoEvent { periph: IoPeripheral::Twi, kind: IoKind::TwiStop, write: true, byte: 0 });
-                    }
-                }
+            // Serial-peripheral handling: capture traffic for the host monitor
+            // and route it through the attached device model (if any). Both are
+            // cheap address comparisons; skipped entirely on a plain run.
+            if self.capture_io || self.responder.is_some() {
+                self.handle_serial_write(io_addr, v);
             }
 
             // ADC: writing ADCSRA with ADEN+ADSC set performs a conversion of the
