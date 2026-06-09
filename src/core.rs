@@ -282,13 +282,15 @@ impl AvrVm {
                 r.uart_tx(v);
             }
         } else if Some(io_addr) == self.spi_data_io {
-            if cap {
-                self.io_events.push(IoEvent { periph: IoPeripheral::Spi, kind: IoKind::Data, write: true, byte: v });
-            }
             let miso = match self.responder.as_mut() {
                 Some(r) => r.spi_transfer(v),
                 None => self.spi_miso,
             };
+            if cap {
+                // SPI is full duplex: record both directions of the exchange.
+                self.io_events.push(IoEvent { periph: IoPeripheral::Spi, kind: IoKind::Data, write: true, byte: v });
+                self.io_events.push(IoEvent { periph: IoPeripheral::Spi, kind: IoKind::Data, write: false, byte: miso });
+            }
             self.io_write_raw(io_addr, miso);
         } else if Some(io_addr) == self.twi_data_io {
             // Stage the byte; it is sent when the program writes TWCR.
