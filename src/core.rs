@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use crate::devices::AvrCoreClass;
 use crate::hw;
@@ -85,6 +85,10 @@ pub trait BusResponder: Send {
     fn uart_poll(&mut self) -> Option<u8> {
         None
     }
+    /// A GPIO port the device watches was written: `addr` is the data-space
+    /// PORT register address and `value` the byte just written. Lets a device
+    /// observe control pins (chip-select, data/command, reset, ...).
+    fn pin_write(&mut self, _addr: u32, _value: u8) {}
     /// Advance device time by `cycles`, for autonomous behaviour.
     fn tick(&mut self, _cycles: u64) {}
 }
@@ -150,6 +154,9 @@ pub struct AvrVm {
     /// Optional model of the external devices on the serial buses. When set, the
     /// VM routes SPI/I2C/UART traffic through it for synchronous responses.
     pub responder: Option<Box<dyn BusResponder>>,
+    /// Data-space PORT addresses whose writes are forwarded to the responder
+    /// (so a device can watch its control pins). Empty = no pin forwarding.
+    pub watch_pins: HashSet<u32>,
     // TWI master decode state (classic AVR), advanced by TWCR/TWDR writes.
     twi_expect_addr: bool,
     twi_twdr_written: bool,
@@ -221,6 +228,7 @@ impl AvrVm {
             uart_rx: VecDeque::new(),
             adc_inputs: [0; 16],
             responder: None,
+            watch_pins: HashSet::new(),
             twi_expect_addr: false,
             twi_twdr_written: false,
             uart_data_io,
@@ -486,6 +494,14 @@ impl AvrVm {
                         self.io_write_raw(adc.datah, ((value >> 8) & 0x03) as u8);
                     }
                     self.io_write_raw(adc.ctrl, v & !0x40); // clear ADSC
+                }
+            }
+
+            // Forward writes of a watched PORT register to the device model so
+            // it can track its control pins (chip-select, data/command, ...).
+            if !self.watch_pins.is_empty() && self.watch_pins.contains(&addr) {
+                if let Some(r) = self.responder.as_mut() {
+                    r.pin_write(addr, v);
                 }
             }
         } else if addr < self.sram_start + self.sram_bytes {
