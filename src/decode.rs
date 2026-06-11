@@ -177,6 +177,37 @@ fn gate_opcode(c: &mut AvrVm, op: u16, pc: u32) -> bool {
         && imm_q(op) != 0
     {
         bad = rc;
+    } else if rc {
+        // Reduced-core register file is r16..r31: any register operand below
+        // r16 is reserved on AVRrc, as are the 2-word LDS/STS encodings.
+        let d = ((op >> 4) & 0x1F) as u8;
+        let r5 = (((op >> 5) & 0x10) | (op & 0x0F)) as u8;
+        bad = match op & 0xF000 {
+            // CPC/SBC/ADD (0x0000 family; MOVW/MULS/FMUL* are gated above).
+            0x0000 => matches!(op & 0xFC00, 0x0400 | 0x0800 | 0x0C00) && (d < 16 || r5 < 16),
+            // CPSE/CP/SUB/ADC and AND/EOR/OR/MOV.
+            0x1000 | 0x2000 => d < 16 || r5 < 16,
+            // LD/ST through X/Y/Z (q == 0 forms; q != 0 is gated above).
+            0x8000 | 0xA000 => d < 16,
+            0x9000 => {
+                if (op & 0xFE0F) == 0x9000 || (op & 0xFE0F) == 0x9200 {
+                    true // 2-word LDS/STS
+                } else if (op & 0xFC00) == 0x9000 {
+                    d < 16 // LD/ST variants, PUSH/POP
+                } else if (op & 0xFE00) == 0x9400
+                    && matches!(op & 0x000F, 0x0..=0x3 | 0x5..=0x7 | 0xA)
+                {
+                    d < 16 // COM/NEG/SWAP/INC/ASR/LSR/ROR/DEC
+                } else {
+                    false
+                }
+            }
+            // IN/OUT.
+            0xB000 => d < 16,
+            // BLD/BST/SBRC/SBRS.
+            0xF000 => (op & 0xF800) == 0xF800 && d < 16,
+            _ => false,
+        };
     }
 
     if bad {
@@ -370,6 +401,12 @@ fn exec_des(c: &mut AvrVm, round: usize, decrypt: bool) {
 }
 
 pub fn step(c: &mut AvrVm) {
+    // The program counter is physically only as wide as the flash, so
+    // execution wraps modulo the flash size — this is how RJMP/RCALL reach
+    // the whole flash on parts without JMP/CALL (8 KB and below).
+    if c.flash_bytes > 0 && c.pc >= c.flash_bytes {
+        c.pc %= c.flash_bytes;
+    }
     let op = c.flash_word(c.pc);
     let cur_pc = c.pc;
     c.pc += 2;

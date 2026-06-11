@@ -108,6 +108,9 @@ pub struct AvrVm {
     pub sram: Vec<u8>,
     pub eeprom: Vec<u8>,
     pub io: Vec<u8>,
+    /// Low data space (0x00-0x3F) backing store for AVRxt/AVRxm cores, where
+    /// VPORTs and GPIO registers live below the CPU SP/SREG registers.
+    pub lowio: [u8; 64],
 
     pub device: String,
     pub core: AvrCoreClass,
@@ -211,6 +214,7 @@ impl AvrVm {
             sram: vec![0; sram_bytes as usize],
             eeprom: vec![0; eeprom_bytes.max(1) as usize],
             io: vec![0; io_bytes as usize],
+            lowio: [0; 64],
             device,
             core,
             flash_bytes,
@@ -291,6 +295,11 @@ impl AvrVm {
             if let Some(r) = self.responder.as_mut() {
                 r.uart_tx(v);
             }
+        } else if self.core == AvrCoreClass::XT && self.twi_ctrl_io.is_some() && {
+            let ctrl = self.twi_ctrl_io.unwrap();
+            io_addr == ctrl || io_addr == ctrl + 3 || io_addr == ctrl + 4
+        } {
+            self.handle_modern_twi_write(io_addr, v);
         } else if Some(io_addr) == self.spi_data_io {
             let miso = match self.responder.as_mut() {
                 Some(r) => r.spi_transfer(v),
@@ -307,6 +316,73 @@ impl AvrVm {
             self.twi_twdr_written = true;
         } else if Some(io_addr) == self.twi_ctrl_io {
             self.handle_twcr_write(v);
+        }
+    }
+
+    /// Decode a modern (AVRxt) TWI master register write into bus actions:
+    /// MADDR (ctrl+3) carries START + slave address (with auto-receive of the
+    /// first byte on a read transaction), MDATA (ctrl+4) carries data bytes,
+    /// and MCTRLB (ctrl) the ACK/NACK + receive-next (MCMD = 2) or STOP
+    /// (MCMD = 3) commands.
+    fn handle_modern_twi_write(&mut self, io_addr: u32, v: u8) {
+        let cap = self.capture_io;
+        let ctrl = match self.twi_ctrl_io {
+            Some(c) => c,
+            None => return,
+        };
+        let mdata = ctrl + 4;
+        if io_addr == ctrl + 3 {
+            if cap {
+                self.io_events.push(IoEvent { periph: IoPeripheral::Twi, kind: IoKind::TwiStart, write: true, byte: 0 });
+                self.io_events.push(IoEvent { periph: IoPeripheral::Twi, kind: IoKind::Data, write: true, byte: v });
+            }
+            let read = v & 1 != 0;
+            if let Some(r) = self.responder.as_mut() {
+                r.i2c_start();
+                r.i2c_address(v >> 1, read);
+            }
+            if read {
+                // The master auto-receives the first byte after SLA+R.
+                let b = match self.responder.as_mut() {
+                    Some(r) => r.i2c_read(false),
+                    None => self.io_read_raw(mdata),
+                };
+                self.io_write_raw(mdata, b);
+                if cap {
+                    self.io_events.push(IoEvent { periph: IoPeripheral::Twi, kind: IoKind::Data, write: false, byte: b });
+                }
+            }
+        } else if io_addr == mdata {
+            if cap {
+                self.io_events.push(IoEvent { periph: IoPeripheral::Twi, kind: IoKind::Data, write: true, byte: v });
+            }
+            if let Some(r) = self.responder.as_mut() {
+                r.i2c_write(v);
+            }
+        } else {
+            // MCTRLB command write: ACKACT in bit 2, MCMD in bits 1:0.
+            let nack = v & 0x04 != 0;
+            match v & 0x03 {
+                0x03 => {
+                    if cap {
+                        self.io_events.push(IoEvent { periph: IoPeripheral::Twi, kind: IoKind::TwiStop, write: true, byte: 0 });
+                    }
+                    if let Some(r) = self.responder.as_mut() {
+                        r.i2c_stop();
+                    }
+                }
+                0x02 => {
+                    let b = match self.responder.as_mut() {
+                        Some(r) => r.i2c_read(nack),
+                        None => self.io_read_raw(mdata),
+                    };
+                    self.io_write_raw(mdata, b);
+                    if cap {
+                        self.io_events.push(IoEvent { periph: IoPeripheral::Twi, kind: IoKind::Data, write: false, byte: b });
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -395,13 +471,13 @@ impl AvrVm {
     }
 
     /// Data-space address of I/O location `a` (the operand of IN/OUT/SBI/CBI/
-    /// SBIC/SBIS). Classic and modern cores alias the I/O file at 0x20 in data
-    /// space; AVRrc has no register-file mapping, so I/O starts at data 0x00.
+    /// SBIC/SBIS). Only the classic cores alias the I/O file at 0x20 in data
+    /// space behind the register file; AVRrc, AVRxt, and AVRxm map I/O (and
+    /// the CPU SP/SREG registers) directly at data 0x00-0x3F.
     pub fn io_data_addr(&self, a: u32) -> u32 {
-        if self.core == AvrCoreClass::RC {
-            a
-        } else {
-            a + 0x20
+        match self.core {
+            AvrCoreClass::RC | AvrCoreClass::XT | AvrCoreClass::XM => a,
+            _ => a + 0x20,
         }
     }
 
@@ -424,13 +500,26 @@ impl AvrVm {
                 0
             };
         }
-        if addr < 32 {
+        if matches!(self.core, AvrCoreClass::XT | AvrCoreClass::XM) && addr < 0x40 {
+            // Modern/XMEGA low data space: VPORTs and GPIO registers from
+            // 0x00, CPU SPL/SPH/SREG at 0x3D-0x3F. The register file is not
+            // memory mapped; peripheral space continues at 0x40 (modelled by
+            // the shifted `io` file below).
+            return match addr {
+                0x3D => (self.sp & 0xFF) as u8,
+                0x3E => (self.sp >> 8) as u8,
+                0x3F => self.sreg,
+                _ => self.lowio[addr as usize],
+            };
+        }
+        let classic = !matches!(self.core, AvrCoreClass::XT | AvrCoreClass::XM);
+        if classic && addr < 32 {
             self.r[addr as usize]
-        } else if addr == 0x5F {
+        } else if classic && addr == 0x5F {
             self.sreg
-        } else if addr == 0x5D {
+        } else if classic && addr == 0x5D {
             (self.sp & 0xFF) as u8
-        } else if addr == 0x5E {
+        } else if classic && addr == 0x5E {
             (self.sp >> 8) as u8
         } else if addr < self.sram_start {
             self.read_io(addr - 0x20)
@@ -502,13 +591,24 @@ impl AvrVm {
             }
             return;
         }
-        if addr < 32 {
+        if matches!(self.core, AvrCoreClass::XT | AvrCoreClass::XM) && addr < 0x40 {
+            // Modern/XMEGA low data space: see `read_data` for the layout.
+            match addr {
+                0x3D => self.sp = (self.sp & 0xFF00) | (v as u16),
+                0x3E => self.sp = (self.sp & 0x00FF) | ((v as u16) << 8),
+                0x3F => self.sreg = v,
+                _ => self.lowio[addr as usize] = v,
+            }
+            return;
+        }
+        let classic = !matches!(self.core, AvrCoreClass::XT | AvrCoreClass::XM);
+        if classic && addr < 32 {
             self.r[addr as usize] = v;
-        } else if addr == 0x5F {
+        } else if classic && addr == 0x5F {
             self.sreg = v;
-        } else if addr == 0x5D {
+        } else if classic && addr == 0x5D {
             self.sp = (self.sp & 0xFF00) | (v as u16);
-        } else if addr == 0x5E {
+        } else if classic && addr == 0x5E {
             self.sp = (self.sp & 0x00FF) | ((v as u16) << 8);
         } else if addr < self.sram_start {
             self.write_io(addr - 0x20, v, addr);
@@ -542,6 +642,26 @@ impl AvrVm {
                 self.eeprom_handle_eecr_write(old, v, ee);
             } else if ee.is_modern && io_addr == ee.ctrl {
                 self.eeprom_handle_modern_write(v, ee);
+            }
+        }
+
+        // Modern (AVRxt) TWI master: writing MADDR (ctrl+3) makes us bus
+        // owner, an MCTRLB (ctrl) STOP command (MCMD = 3) returns the bus to
+        // idle. The BUSSTATE bits in MSTATUS (ctrl+1) are kept current even
+        // on a plain run, because the std driver routes the address write
+        // through them.
+        if self.core == AvrCoreClass::XT {
+            if let Some(twi) = hw::twi_hw(&self.device) {
+                if twi.ctrl != 0 {
+                    let mstatus = twi.ctrl + 1;
+                    if io_addr == twi.ctrl + 3 {
+                        let st = self.io_read_raw(mstatus);
+                        self.io_write_raw(mstatus, (st & !0x03) | 0x02); // owner
+                    } else if io_addr == twi.ctrl && (v & 0x03) == 0x03 {
+                        let st = self.io_read_raw(mstatus);
+                        self.io_write_raw(mstatus, (st & !0x03) | 0x01); // idle
+                    }
+                }
             }
         }
 
@@ -657,6 +777,7 @@ impl AvrVm {
     pub fn reset(&mut self) {
         self.r = [0; 32];
         self.io.fill(0);
+        self.lowio.fill(0);
         self.sram.fill(0);
         self.pc = 0;
         self.sp = (self.sram_start + self.sram_bytes - 1) as u16;
@@ -847,7 +968,11 @@ impl AvrVm {
     }
 
     fn vector_slot_bytes(&self) -> u32 {
-        if self.core == AvrCoreClass::RC {
+        // Parts with 8 KB of flash or less have 1-word (RJMP) vector slots;
+        // larger parts have 2-word (JMP) slots. This matches the datasheet
+        // tables, not the core family: a classic ATmega8 and an AVRrc tiny
+        // both use 1-word vectors.
+        if self.flash_bytes <= 8192 {
             2
         } else {
             4
