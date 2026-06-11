@@ -179,13 +179,23 @@ impl AvrVm {
         eeprom_bytes: u32,
         sram_start: u32,
     ) -> Self {
-        let io_bytes = sram_start.saturating_sub(0x20);
+        // The io vec is indexed by datasheet I/O address. On AVRrc the whole
+        // 0x00..sram_start data range below SRAM is I/O; elsewhere the first
+        // 0x20 data addresses are the register file.
+        let io_bytes = if core == AvrCoreClass::RC {
+            sram_start
+        } else {
+            sram_start.saturating_sub(0x20)
+        };
         let timer0_compa_vec = timer0_compa_vec_for(&device);
-        let uart_data_io = hw::uart_hw(&device).map(|u| u.data);
-        let uart_status_io = hw::uart_hw(&device).map(|u| u.status);
-        let spi_data_io = hw::spi_hw(&device).map(|s| s.data);
-        let twi_data_io = hw::twi_hw(&device).map(|t| t.data);
-        let twi_ctrl_io = hw::twi_hw(&device).map(|t| t.ctrl);
+        // Address 0 in the hardware tables means "no such peripheral register";
+        // it must never match a real I/O access (I/O 0x00 is a live register on
+        // many parts, e.g. PINA on the reduced-core tinys).
+        let uart_data_io = hw::uart_hw(&device).map(|u| u.data).filter(|&a| a != 0);
+        let uart_status_io = hw::uart_hw(&device).map(|u| u.status).filter(|&a| a != 0);
+        let spi_data_io = hw::spi_hw(&device).map(|s| s.data).filter(|&a| a != 0);
+        let twi_data_io = hw::twi_hw(&device).map(|t| t.data).filter(|&a| a != 0);
+        let twi_ctrl_io = hw::twi_hw(&device).map(|t| t.ctrl).filter(|&a| a != 0);
         let adc = hw::adc_hw(&device);
         Self {
             r: [0; 32],
@@ -384,52 +394,46 @@ impl AvrVm {
         self.trace_buf.push(line);
     }
 
+    /// Data-space address of I/O location `a` (the operand of IN/OUT/SBI/CBI/
+    /// SBIC/SBIS). Classic and modern cores alias the I/O file at 0x20 in data
+    /// space; AVRrc has no register-file mapping, so I/O starts at data 0x00.
+    pub fn io_data_addr(&self, a: u32) -> u32 {
+        if self.core == AvrCoreClass::RC {
+            a
+        } else {
+            a + 0x20
+        }
+    }
+
     pub fn read_data(&mut self, addr: u32) -> u8 {
+        if self.core == AvrCoreClass::RC {
+            // AVRrc data space (ATtiny4/5/9/10/20/40): the register file is
+            // not memory mapped. I/O occupies 0x00-0x3F with SPL/SPH/SREG at
+            // 0x3D/0x3E/0x3F, and SRAM starts immediately after at 0x40.
+            return if addr == 0x3D {
+                (self.sp & 0xFF) as u8
+            } else if addr == 0x3E {
+                (self.sp >> 8) as u8
+            } else if addr == 0x3F {
+                self.sreg
+            } else if addr < self.sram_start {
+                self.read_io(addr)
+            } else if addr < self.sram_start + self.sram_bytes {
+                self.sram[(addr - self.sram_start) as usize]
+            } else {
+                0
+            };
+        }
         if addr < 32 {
             self.r[addr as usize]
-        } else if self.core != AvrCoreClass::RC && addr == 0x5F {
+        } else if addr == 0x5F {
             self.sreg
-        } else if self.core != AvrCoreClass::RC && addr == 0x5D {
+        } else if addr == 0x5D {
             (self.sp & 0xFF) as u8
-        } else if self.core != AvrCoreClass::RC && addr == 0x5E {
+        } else if addr == 0x5E {
             (self.sp >> 8) as u8
         } else if addr < self.sram_start {
-            let io_addr = addr - 0x20;
-
-            if let Some(ee) = hw::eeprom_hw(&self.device) {
-                if ee.is_modern && io_addr == ee.data {
-                    let eear = self.eeprom_address(ee);
-                    if eear < self.eeprom_bytes {
-                        return self.eeprom[eear as usize];
-                    }
-                }
-            }
-
-            if let Some(spi) = hw::spi_hw(&self.device) {
-                if io_addr == spi.status {
-                    return self.io_read_raw(io_addr) | 0x80;
-                }
-            }
-
-            if let Some(twi) = hw::twi_hw(&self.device) {
-                if io_addr == twi.ctrl {
-                    return self.io_read_raw(io_addr) | 0x80;
-                }
-            }
-
-            // USART status: UDRE/TXC always ready; RXC set while bytes wait.
-            if Some(io_addr) == self.uart_status_io {
-                let rxc = if self.uart_rx.is_empty() { 0 } else { 0x80 };
-                return self.io_read_raw(io_addr) | 0x60 | rxc;
-            }
-            // USART data: a read consumes the next received byte.
-            if Some(io_addr) == self.uart_data_io {
-                if let Some(b) = self.uart_rx.pop_front() {
-                    return b;
-                }
-            }
-
-            self.io_read_raw(io_addr)
+            self.read_io(addr - 0x20)
         } else if addr < self.sram_start + self.sram_bytes {
             self.sram[(addr - self.sram_start) as usize]
         } else {
@@ -437,77 +441,143 @@ impl AvrVm {
         }
     }
 
+    /// Read one byte from the I/O file at `io_addr` (datasheet I/O address),
+    /// applying the peripheral models layered over the raw register bytes.
+    fn read_io(&mut self, io_addr: u32) -> u8 {
+        if let Some(ee) = hw::eeprom_hw(&self.device) {
+            if ee.is_modern && ee.data != 0 && io_addr == ee.data {
+                let eear = self.eeprom_address(ee);
+                if eear < self.eeprom_bytes {
+                    return self.eeprom[eear as usize];
+                }
+            }
+        }
+
+        if let Some(spi) = hw::spi_hw(&self.device) {
+            if spi.status != 0 && io_addr == spi.status {
+                return self.io_read_raw(io_addr) | 0x80;
+            }
+        }
+
+        if let Some(twi) = hw::twi_hw(&self.device) {
+            if twi.ctrl != 0 && io_addr == twi.ctrl {
+                return self.io_read_raw(io_addr) | 0x80;
+            }
+            // Modern (AVRxt) TWI: the table's ctrl is MCTRLB (offset 0x04);
+            // MSTATUS sits right after it (offset 0x05). Fake WIF|RIF so the
+            // host-side master poll loop sees every transfer complete.
+            if self.core == AvrCoreClass::XT && twi.ctrl != 0 && io_addr == twi.ctrl + 1 {
+                return self.io_read_raw(io_addr) | 0xC0;
+            }
+        }
+
+        // USART status: UDRE/TXC always ready; RXC set while bytes wait.
+        if Some(io_addr) == self.uart_status_io {
+            let rxc = if self.uart_rx.is_empty() { 0 } else { 0x80 };
+            return self.io_read_raw(io_addr) | 0x60 | rxc;
+        }
+        // USART data: a read consumes the next received byte.
+        if Some(io_addr) == self.uart_data_io {
+            if let Some(b) = self.uart_rx.pop_front() {
+                return b;
+            }
+        }
+
+        self.io_read_raw(io_addr)
+    }
+
     pub fn write_data(&mut self, addr: u32, v: u8) {
+        if self.core == AvrCoreClass::RC {
+            // AVRrc data space: see `read_data` for the layout.
+            if addr == 0x3D {
+                self.sp = (self.sp & 0xFF00) | (v as u16);
+            } else if addr == 0x3E {
+                self.sp = (self.sp & 0x00FF) | ((v as u16) << 8);
+            } else if addr == 0x3F {
+                self.sreg = v;
+            } else if addr < self.sram_start {
+                self.write_io(addr, v, addr);
+            } else if addr < self.sram_start + self.sram_bytes {
+                self.sram[(addr - self.sram_start) as usize] = v;
+            }
+            return;
+        }
         if addr < 32 {
             self.r[addr as usize] = v;
-        } else if self.core != AvrCoreClass::RC && addr == 0x5F {
+        } else if addr == 0x5F {
             self.sreg = v;
-        } else if self.core != AvrCoreClass::RC && addr == 0x5D {
+        } else if addr == 0x5D {
             self.sp = (self.sp & 0xFF00) | (v as u16);
-        } else if self.core != AvrCoreClass::RC && addr == 0x5E {
+        } else if addr == 0x5E {
             self.sp = (self.sp & 0x00FF) | ((v as u16) << 8);
         } else if addr < self.sram_start {
-            let io_addr = addr - 0x20;
-            let ee = hw::eeprom_hw(&self.device);
-
-            if let Some(ee) = ee {
-                if self.eeprom_write_cycles_left > 0
-                    && (io_addr == ee.ctrl
-                        || io_addr == ee.addr_l
-                        || io_addr == ee.addr_h
-                        || io_addr == ee.data)
-                {
-                    return;
-                }
-            }
-
-            let old = self.io_read_raw(io_addr);
-            self.io_write_raw(io_addr, v);
-
-            if let Some(ee) = ee {
-                if !ee.is_modern && io_addr == ee.ctrl {
-                    self.eeprom_handle_eecr_write(old, v, ee);
-                } else if ee.is_modern && io_addr == ee.ctrl {
-                    self.eeprom_handle_modern_write(v, ee);
-                }
-            }
-
-            // Serial-peripheral handling: capture traffic for the host monitor
-            // and route it through the attached device model (if any). Both are
-            // cheap address comparisons; skipped entirely on a plain run.
-            if self.capture_io || self.responder.is_some() {
-                self.handle_serial_write(io_addr, v);
-            }
-
-            // ADC: writing ADCSRA with ADEN+ADSC set performs a conversion of the
-            // ADMUX-selected channel from the host-supplied input, then clears
-            // ADSC so a polling loop sees the conversion complete.
-            if let Some(adc) = self.adc {
-                if io_addr == adc.ctrl && v & 0x80 != 0 && v & 0x40 != 0 {
-                    let mux = self.io_read_raw(adc.mux);
-                    let channel = (mux & 0x0F) as usize;
-                    let value = self.adc_inputs.get(channel).copied().unwrap_or(0) & 0x3FF;
-                    if mux & 0x20 != 0 {
-                        // ADLAR: left-adjusted result.
-                        self.io_write_raw(adc.datah, (value >> 2) as u8);
-                        self.io_write_raw(adc.datal, ((value << 6) & 0xC0) as u8);
-                    } else {
-                        self.io_write_raw(adc.datal, (value & 0xFF) as u8);
-                        self.io_write_raw(adc.datah, ((value >> 8) & 0x03) as u8);
-                    }
-                    self.io_write_raw(adc.ctrl, v & !0x40); // clear ADSC
-                }
-            }
-
-            // Forward writes of a watched PORT register to the device model so
-            // it can track its control pins (chip-select, data/command, ...).
-            if !self.watch_pins.is_empty() && self.watch_pins.contains(&addr) {
-                if let Some(r) = self.responder.as_mut() {
-                    r.pin_write(addr, v);
-                }
-            }
+            self.write_io(addr - 0x20, v, addr);
         } else if addr < self.sram_start + self.sram_bytes {
             self.sram[(addr - self.sram_start) as usize] = v;
+        }
+    }
+
+    /// Write one byte to the I/O file at `io_addr` (datasheet I/O address).
+    /// `data_addr` is the originating data-space address, used for the
+    /// watched-pin forwarding which is keyed on data-space PORT addresses.
+    fn write_io(&mut self, io_addr: u32, v: u8, data_addr: u32) {
+        let ee = hw::eeprom_hw(&self.device);
+
+        if let Some(ee) = ee {
+            if self.eeprom_write_cycles_left > 0
+                && (io_addr == ee.ctrl
+                    || io_addr == ee.addr_l
+                    || io_addr == ee.addr_h
+                    || io_addr == ee.data)
+            {
+                return;
+            }
+        }
+
+        let old = self.io_read_raw(io_addr);
+        self.io_write_raw(io_addr, v);
+
+        if let Some(ee) = ee {
+            if !ee.is_modern && io_addr == ee.ctrl {
+                self.eeprom_handle_eecr_write(old, v, ee);
+            } else if ee.is_modern && io_addr == ee.ctrl {
+                self.eeprom_handle_modern_write(v, ee);
+            }
+        }
+
+        // Serial-peripheral handling: capture traffic for the host monitor
+        // and route it through the attached device model (if any). Both are
+        // cheap address comparisons; skipped entirely on a plain run.
+        if self.capture_io || self.responder.is_some() {
+            self.handle_serial_write(io_addr, v);
+        }
+
+        // ADC: writing ADCSRA with ADEN+ADSC set performs a conversion of the
+        // ADMUX-selected channel from the host-supplied input, then clears
+        // ADSC so a polling loop sees the conversion complete.
+        if let Some(adc) = self.adc {
+            if io_addr == adc.ctrl && v & 0x80 != 0 && v & 0x40 != 0 {
+                let mux = self.io_read_raw(adc.mux);
+                let channel = (mux & 0x0F) as usize;
+                let value = self.adc_inputs.get(channel).copied().unwrap_or(0) & 0x3FF;
+                if mux & 0x20 != 0 {
+                    // ADLAR: left-adjusted result.
+                    self.io_write_raw(adc.datah, (value >> 2) as u8);
+                    self.io_write_raw(adc.datal, ((value << 6) & 0xC0) as u8);
+                } else {
+                    self.io_write_raw(adc.datal, (value & 0xFF) as u8);
+                    self.io_write_raw(adc.datah, ((value >> 8) & 0x03) as u8);
+                }
+                self.io_write_raw(adc.ctrl, v & !0x40); // clear ADSC
+            }
+        }
+
+        // Forward writes of a watched PORT register to the device model so
+        // it can track its control pins (chip-select, data/command, ...).
+        if !self.watch_pins.is_empty() && self.watch_pins.contains(&data_addr) {
+            if let Some(r) = self.responder.as_mut() {
+                r.pin_write(data_addr, v);
+            }
         }
     }
 

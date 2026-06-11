@@ -843,7 +843,7 @@ pub fn step(c: &mut AvrVm) {
                 // SBIS
                 let a = ((op >> 3) & 0x1F) as u32;
                 let b = (op & 0x07) as u8;
-                let val = c.read_data(a + 0x20);
+                let val = c.read_data(c.io_data_addr(a));
                 c.cycles += 1;
                 if (val & (1 << b)) != 0 {
                     do_skip(c);
@@ -852,7 +852,7 @@ pub fn step(c: &mut AvrVm) {
                 // SBIC
                 let a = ((op >> 3) & 0x1F) as u32;
                 let b = (op & 0x07) as u8;
-                let val = c.read_data(a + 0x20);
+                let val = c.read_data(c.io_data_addr(a));
                 c.cycles += 1;
                 if (val & (1 << b)) == 0 {
                     do_skip(c);
@@ -861,17 +861,17 @@ pub fn step(c: &mut AvrVm) {
                 // SBI
                 let a = ((op >> 3) & 0x1F) as u32;
                 let b = (op & 0x07) as u8;
-                let mut val = c.read_data(a + 0x20);
+                let mut val = c.read_data(c.io_data_addr(a));
                 val |= 1 << b;
-                c.write_data(a + 0x20, val);
+                c.write_data(c.io_data_addr(a), val);
                 c.cycles += 2;
             } else if (op & 0xFF00) == 0x9800 {
                 // CBI
                 let a = ((op >> 3) & 0x1F) as u32;
                 let b = (op & 0x07) as u8;
-                let mut val = c.read_data(a + 0x20);
+                let mut val = c.read_data(c.io_data_addr(a));
                 val &= !(1 << b);
-                c.write_data(a + 0x20, val);
+                c.write_data(c.io_data_addr(a), val);
                 c.cycles += 2;
             } else if op == 0x9598 {
                 // BREAK
@@ -926,12 +926,12 @@ pub fn step(c: &mut AvrVm) {
             if (op & 0xF800) == 0xB000 {
                 // IN
                 let a = ((op >> 5) & 0x30) | (op & 0x0F);
-                c.r[d] = c.read_data(a as u32 + 0x20);
+                c.r[d] = c.read_data(c.io_data_addr(a as u32));
                 c.cycles += 1;
             } else if (op & 0xF800) == 0xB800 {
                 // OUT
                 let a = ((op >> 5) & 0x30) | (op & 0x0F);
-                c.write_data(a as u32 + 0x20, c.r[d]);
+                c.write_data(c.io_data_addr(a as u32), c.r[d]);
                 c.cycles += 1;
             }
         }
