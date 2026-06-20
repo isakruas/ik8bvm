@@ -17,12 +17,19 @@ use std::collections::{HashSet, VecDeque};
 use crate::devices::AvrCoreClass;
 use crate::hw;
 
+// Timer0 register I/O addresses (atmega328p), used by the unit tests below; the
+// runtime timer model takes addresses from `hw::timers` per device.
+#[cfg(test)]
 const IO_TCCR0A: u32 = 0x24;
+#[cfg(test)]
 const IO_TCCR0B: u32 = 0x25;
-const IO_TCNT0: u32 = 0x26;
+#[cfg(test)]
 const IO_OCR0A: u32 = 0x27;
+#[cfg(test)]
 const IO_TIFR0: u32 = 0x15;
+#[cfg(test)]
 const IO_TIMSK0: u32 = 0x4E;
+#[cfg(test)]
 const BIT_OCF0A: u8 = 1;
 
 /// Which on-chip serial peripheral an [`IoEvent`] belongs to.
@@ -135,8 +142,10 @@ pub struct AvrVm {
     pub eeprom_write_cycles_left: u32,
     pub eeprom_write_addr: u32,
     pub eeprom_write_val: u8,
-    pub timer0_acc: u32,
-    pub timer0_compa_vec: u8,
+    /// Per-timer prescaler remainder (slot index = `TimerHw.acc`).
+    pub timer_accs: [u32; 4],
+    /// Timer/counter descriptors for the active device (empty = none modelled).
+    pub timers: Vec<hw::TimerHw>,
     pub irq_pending: [bool; 256],
 
     /// When set, writes to the UART/SPI/TWI data registers are recorded into
@@ -170,7 +179,18 @@ pub struct AvrVm {
     spi_data_io: Option<u32>,
     twi_data_io: Option<u32>,
     twi_ctrl_io: Option<u32>,
+    uart_ctrl_io: Option<u32>,
+    spi_ctrl_io: Option<u32>,
+    spi_status_io: Option<u32>,
     adc: Option<hw::AdcHw>,
+    /// Non-timer interrupt vectors (UART RX, ADC, SPI, TWI, INT0/1) for the part.
+    periph: Option<hw::PeriphIrqs>,
+    /// External interrupts (INT0/INT1) and the previous level of each watched pin.
+    ext_irqs: Vec<hw::ExtIrq>,
+    ext_prev: Vec<u8>,
+    /// Pin-change interrupt groups and the previous masked snapshot of each.
+    pc_ints: Vec<hw::PcIntGroup>,
+    pcint_prev: Vec<u8>,
 }
 
 impl AvrVm {
@@ -190,7 +210,7 @@ impl AvrVm {
         } else {
             sram_start.saturating_sub(0x20)
         };
-        let timer0_compa_vec = timer0_compa_vec_for(&device);
+        let timers = hw::timers(&device);
         // Address 0 in the hardware tables means "no such peripheral register";
         // it must never match a real I/O access (I/O 0x00 is a live register on
         // many parts, e.g. PINA on the reduced-core tinys).
@@ -199,7 +219,15 @@ impl AvrVm {
         let spi_data_io = hw::spi_hw(&device).map(|s| s.data).filter(|&a| a != 0);
         let twi_data_io = hw::twi_hw(&device).map(|t| t.data).filter(|&a| a != 0);
         let twi_ctrl_io = hw::twi_hw(&device).map(|t| t.ctrl).filter(|&a| a != 0);
+        let uart_ctrl_io = hw::uart_hw(&device).map(|u| u.ctrl).filter(|&a| a != 0);
+        let spi_ctrl_io = hw::spi_hw(&device).map(|s| s.ctrl).filter(|&a| a != 0);
+        let spi_status_io = hw::spi_hw(&device).map(|s| s.status).filter(|&a| a != 0);
         let adc = hw::adc_hw(&device);
+        let periph = hw::periph_irqs(&device);
+        let ext_irqs = hw::ext_irqs(&device);
+        let ext_prev = vec![1u8; ext_irqs.len()]; // assume inputs idle-high (pull-ups)
+        let pc_ints = hw::pc_ints(&device);
+        let pcint_prev = vec![0u8; pc_ints.len()];
         Self {
             r: [0; 32],
             pc: 0,
@@ -233,8 +261,8 @@ impl AvrVm {
             eeprom_write_cycles_left: 0,
             eeprom_write_addr: 0,
             eeprom_write_val: 0,
-            timer0_acc: 0,
-            timer0_compa_vec,
+            timer_accs: [0; 4],
+            timers,
             irq_pending: [false; 256],
             capture_io: false,
             io_events: Vec::new(),
@@ -250,7 +278,15 @@ impl AvrVm {
             spi_data_io,
             twi_data_io,
             twi_ctrl_io,
+            uart_ctrl_io,
+            spi_ctrl_io,
+            spi_status_io,
             adc,
+            periph,
+            ext_irqs,
+            ext_prev,
+            pc_ints,
+            pcint_prev,
         }
     }
 
@@ -311,11 +347,17 @@ impl AvrVm {
                 self.io_events.push(IoEvent { periph: IoPeripheral::Spi, kind: IoKind::Data, write: false, byte: miso });
             }
             self.io_write_raw(io_addr, miso);
+            if let Some(st) = self.spi_status_io {
+                self.io_set_bits(st, 0x80); // SPIF: transfer complete
+            }
         } else if Some(io_addr) == self.twi_data_io {
             // Stage the byte; it is sent when the program writes TWCR.
             self.twi_twdr_written = true;
         } else if Some(io_addr) == self.twi_ctrl_io {
             self.handle_twcr_write(v);
+            if let Some(ctrl) = self.twi_ctrl_io {
+                self.io_set_bits(ctrl, 0x80); // TWINT: operation complete
+            }
         }
     }
 
@@ -688,7 +730,8 @@ impl AvrVm {
                     self.io_write_raw(adc.datal, (value & 0xFF) as u8);
                     self.io_write_raw(adc.datah, ((value >> 8) & 0x03) as u8);
                 }
-                self.io_write_raw(adc.ctrl, v & !0x40); // clear ADSC
+                let cleared = v & !0x40; // clear ADSC
+                self.io_write_raw(adc.ctrl, cleared | 0x10); // set ADIF (conversion complete)
             }
         }
 
@@ -764,7 +807,9 @@ impl AvrVm {
         crate::decode::step(self);
         let consumed = self.cycles.saturating_sub(start_cycles);
         self.advance_eeprom_timers(consumed);
-        self.timer0_tick(consumed as u32);
+        self.tick_timers(consumed as u32);
+        self.tick_ext_irqs();
+        self.tick_pcint();
         self.service_interrupts();
     }
 
@@ -796,7 +841,7 @@ impl AvrVm {
         self.eeprom_write_cycles_left = 0;
         self.eeprom_write_addr = 0;
         self.eeprom_write_val = 0;
-        self.timer0_acc = 0;
+        self.timer_accs = [0; 4];
         self.irq_pending = [false; 256];
     }
 
@@ -901,47 +946,210 @@ impl AvrVm {
         }
     }
 
-    fn timer0_tick(&mut self, cycles: u32) {
-        if self.timer0_compa_vec == 0 {
-            return;
+    /// Advance every modelled timer by `cycles`, setting overflow / compare
+    /// flags. Each timer counts at its own prescaler; in CTC mode it clears at
+    /// OCRA (setting the compare flag), otherwise it wraps (setting overflow).
+    fn tick_timers(&mut self, cycles: u32) {
+        for i in 0..self.timers.len() {
+            let t = self.timers[i]; // TimerHw is Copy: no borrow conflict / alloc.
+            let prescaler = cs_prescaler(self.io_read_raw(t.clock_reg));
+            if prescaler == 0 {
+                continue; // clock stopped (CS = 0) or external source.
+            }
+            self.timer_accs[t.acc] = self.timer_accs[t.acc].saturating_add(cycles);
+            let ctc = (self.io_read_raw(t.ctc_reg) & t.ctc_mask) == t.ctc_val;
+            let mut guard = 0u32;
+            while self.timer_accs[t.acc] >= prescaler && guard < 200_000 {
+                self.timer_accs[t.acc] -= prescaler;
+                guard += 1;
+                self.timer_count(&t, ctc);
+            }
         }
+    }
 
-        let prescaler = match self.io_read_raw(IO_TCCR0B) & 0x07 {
-            1 => 1,
-            2 => 8,
-            3 => 64,
-            4 => 256,
-            5 => 1024,
-            _ => return,
-        };
-
-        let ctc = (self.io_read_raw(IO_TCCR0A) & 0x03) == 0x02;
-        let ocr = self.io_read_raw(IO_OCR0A);
-        self.timer0_acc = self.timer0_acc.saturating_add(cycles);
-
-        while self.timer0_acc >= prescaler {
-            self.timer0_acc -= prescaler;
-            let t = self.io_read_raw(IO_TCNT0);
-            if ctc && t == ocr {
-                self.io_write_raw(IO_TCNT0, 0);
-                self.io_set_bits(IO_TIFR0, 1 << BIT_OCF0A);
+    /// Advance one timer by a single tick.
+    fn timer_count(&mut self, t: &hw::TimerHw, ctc: bool) {
+        if t.bits16 {
+            let cnt = ((self.io_read_raw(t.tcnt_h) as u16) << 8) | self.io_read_raw(t.tcnt) as u16;
+            let ocra = ((self.io_read_raw(t.ocra_h) as u16) << 8) | self.io_read_raw(t.ocra) as u16;
+            if ctc && cnt == ocra {
+                self.io_write_raw(t.tcnt, 0);
+                self.io_write_raw(t.tcnt_h, 0);
+                self.set_timer_flag(t.compa);
             } else {
-                let next = t.wrapping_add(1);
-                self.io_write_raw(IO_TCNT0, next);
-                if !ctc && next == ocr {
-                    self.io_set_bits(IO_TIFR0, 1 << BIT_OCF0A);
+                let next = cnt.wrapping_add(1);
+                self.io_write_raw(t.tcnt, (next & 0xFF) as u8);
+                self.io_write_raw(t.tcnt_h, (next >> 8) as u8);
+                if next == 0 {
+                    self.set_timer_flag(t.ovf);
+                }
+                if next == ocra {
+                    self.set_timer_flag(t.compa);
+                }
+                if t.compb.vector != 0 {
+                    let ocrb = ((self.io_read_raw(t.ocrb_h) as u16) << 8) | self.io_read_raw(t.ocrb) as u16;
+                    if next == ocrb {
+                        self.set_timer_flag(t.compb);
+                    }
+                }
+            }
+        } else {
+            let cnt = self.io_read_raw(t.tcnt);
+            let ocra = self.io_read_raw(t.ocra);
+            if ctc && cnt == ocra {
+                self.io_write_raw(t.tcnt, 0);
+                self.set_timer_flag(t.compa);
+            } else {
+                let next = cnt.wrapping_add(1);
+                self.io_write_raw(t.tcnt, next);
+                if next == 0 {
+                    self.set_timer_flag(t.ovf);
+                }
+                if next == ocra {
+                    self.set_timer_flag(t.compa);
+                }
+                if t.compb.vector != 0 {
+                    let ocrb = self.io_read_raw(t.ocrb);
+                    if next == ocrb {
+                        self.set_timer_flag(t.compb);
+                    }
                 }
             }
         }
     }
 
-    fn service_interrupts(&mut self) {
-        if self.timer0_compa_vec != 0
-            && (self.io_read_raw(IO_TIMSK0) & (1 << BIT_OCF0A)) != 0
-            && (self.io_read_raw(IO_TIFR0) & (1 << BIT_OCF0A)) != 0
-        {
-            self.raise_interrupt(self.timer0_compa_vec);
+    /// Watch each external-interrupt pin and set its EIFR flag on the configured
+    /// edge/level (EICRA sense bits): 0=low level, 1=any edge, 2=falling, 3=rising.
+    fn tick_ext_irqs(&mut self) {
+        for i in 0..self.ext_irqs.len() {
+            let e = self.ext_irqs[i];
+            let cur = (self.io_read_raw(e.pin_reg) >> e.pin_bit) & 1;
+            let prev = self.ext_prev[i];
+            let sense = (self.io_read_raw(e.sense_reg) >> e.sense_shift) & 0x03;
+            let trigger = match sense {
+                0 => cur == 0,            // low level (held while low)
+                1 => cur != prev,         // any logical change
+                2 => prev == 1 && cur == 0, // falling edge
+                _ => prev == 0 && cur == 1, // rising edge
+            };
+            if trigger {
+                self.io_set_bits(e.flag_reg, 1 << e.flag_bit);
+            }
+            self.ext_prev[i] = cur;
         }
+    }
+
+    /// Watch each enabled pin-change pin (PCMSK) and set the group's PCIFR flag
+    /// when the masked snapshot changes.
+    fn tick_pcint(&mut self) {
+        for i in 0..self.pc_ints.len() {
+            let g = self.pc_ints[i];
+            let msk = self.io_read_raw(g.pcmsk);
+            let mut snap = 0u8;
+            for b in 0..8 {
+                if msk & (1 << b) != 0 {
+                    let (preg, pbit) = g.pins[b];
+                    if preg != 0 && (self.io_read_raw(preg) >> pbit) & 1 != 0 {
+                        snap |= 1 << b;
+                    }
+                }
+            }
+            if snap != self.pcint_prev[i] {
+                self.io_set_bits(g.pcifr, 1 << g.pcif_bit);
+            }
+            self.pcint_prev[i] = snap;
+        }
+    }
+
+    fn set_timer_flag(&mut self, irq: hw::TimerIrq) {
+        if irq.vector != 0 {
+            self.io_set_bits(irq.flag_reg, 1 << irq.bit);
+        }
+    }
+
+    /// Queue peripheral interrupts whose enable bit and completion flag are set.
+    /// Uses the standard AVR bit positions; events are driven by the VM's own
+    /// UART receive FIFO, ADC conversion, SPI transfer and TWI operation.
+    fn service_periph_interrupts(&mut self) {
+        let Some(p) = self.periph else { return };
+
+        // USART RX complete: RXCIE (UCSRB bit7) + a byte waiting (RXC).
+        if p.uart_rx != 0 && !self.uart_rx.is_empty() {
+            if let Some(ctrl) = self.uart_ctrl_io {
+                if self.io_read_raw(ctrl) & (1 << 7) != 0 {
+                    self.raise_interrupt(p.uart_rx);
+                }
+            }
+        }
+
+        // ADC conversion complete: ADIE (ADCSRA bit3) + ADIF (ADCSRA bit4).
+        if p.adc != 0 {
+            if let Some(adc) = self.adc {
+                let c = self.io_read_raw(adc.ctrl);
+                if c & (1 << 3) != 0 && c & (1 << 4) != 0 {
+                    self.raise_interrupt(p.adc);
+                }
+            }
+        }
+
+        // SPI transfer complete: SPIE (SPCR bit7) + SPIF (SPSR bit7).
+        if p.spi != 0 {
+            if let (Some(ctrl), Some(st)) = (self.spi_ctrl_io, self.spi_status_io) {
+                if self.io_read_raw(ctrl) & (1 << 7) != 0 && self.io_read_raw(st) & (1 << 7) != 0 {
+                    self.raise_interrupt(p.spi);
+                }
+            }
+        }
+
+        // TWI operation complete: TWIE (TWCR bit0) + TWINT (TWCR bit7).
+        if p.twi != 0 {
+            if let Some(ctrl) = self.twi_ctrl_io {
+                let c = self.io_read_raw(ctrl);
+                if c & (1 << 0) != 0 && c & (1 << 7) != 0 {
+                    self.raise_interrupt(p.twi);
+                }
+            }
+        }
+
+        // External interrupts INT0/INT1: enable bit (EIMSK/GICR) + flag (EIFR/GIFR).
+        for i in 0..self.ext_irqs.len() {
+            let e = self.ext_irqs[i];
+            if self.io_read_raw(e.enable_reg) & (1 << e.enable_bit) != 0
+                && self.io_read_raw(e.flag_reg) & (1 << e.flag_bit) != 0
+            {
+                self.raise_interrupt(e.vector);
+            }
+        }
+
+        // Pin-change interrupts: PCIE (PCICR) + PCIF (PCIFR) per group.
+        for i in 0..self.pc_ints.len() {
+            let g = self.pc_ints[i];
+            if self.io_read_raw(g.pcicr) & (1 << g.pcie_bit) != 0
+                && self.io_read_raw(g.pcifr) & (1 << g.pcif_bit) != 0
+            {
+                self.raise_interrupt(g.vector);
+            }
+        }
+    }
+
+    fn service_interrupts(&mut self) {
+        // Raise any timer interrupt whose enable bit (TIMSK) and flag bit (TIFR)
+        // are both set. Other sources are queued directly via `raise_interrupt`.
+        for i in 0..self.timers.len() {
+            let t = self.timers[i];
+            for irq in [t.ovf, t.compa, t.compb] {
+                if irq.vector != 0
+                    && (self.io_read_raw(irq.enable_reg) & (1 << irq.bit)) != 0
+                    && (self.io_read_raw(irq.flag_reg) & (1 << irq.bit)) != 0
+                {
+                    self.raise_interrupt(irq.vector);
+                }
+            }
+        }
+
+        // Non-timer (peripheral) interrupt sources, gated by their enable bit and
+        // the matching completion flag — driven by events the VM already models.
+        self.service_periph_interrupts();
 
         if !self.get_flag(7) {
             return;
@@ -954,8 +1162,47 @@ impl AvrVm {
         self.irq_pending[vec] = false;
         self.set_flag(7, false);
 
-        if self.timer0_compa_vec != 0 && vec as u8 == self.timer0_compa_vec {
-            self.io_clear_bits(IO_TIFR0, 1 << BIT_OCF0A);
+        // Entering a timer ISR clears its flag in hardware.
+        for i in 0..self.timers.len() {
+            let t = self.timers[i];
+            for irq in [t.ovf, t.compa, t.compb] {
+                if irq.vector as usize == vec {
+                    self.io_clear_bits(irq.flag_reg, 1 << irq.bit);
+                }
+            }
+        }
+        // Clear the peripheral completion flag for the source being serviced, so
+        // a level-triggered source does not re-fire every instruction.
+        if let Some(p) = self.periph {
+            if let (Some(adc), v) = (self.adc, vec) {
+                if v == p.adc as usize {
+                    self.io_clear_bits(adc.ctrl, 1 << 4); // ADIF
+                }
+            }
+            if let Some(st) = self.spi_status_io {
+                if vec == p.spi as usize {
+                    self.io_clear_bits(st, 0x80); // SPIF
+                }
+            }
+            if let Some(ctrl) = self.twi_ctrl_io {
+                if vec == p.twi as usize {
+                    self.io_clear_bits(ctrl, 0x80); // TWINT
+                }
+            }
+        }
+        // Entering an external-interrupt ISR clears its EIFR flag (edge modes).
+        for i in 0..self.ext_irqs.len() {
+            let e = self.ext_irqs[i];
+            if e.vector as usize == vec {
+                self.io_clear_bits(e.flag_reg, 1 << e.flag_bit);
+            }
+        }
+        // Entering a pin-change ISR clears its PCIFR flag.
+        for i in 0..self.pc_ints.len() {
+            let g = self.pc_ints[i];
+            if g.vector as usize == vec {
+                self.io_clear_bits(g.pcifr, 1 << g.pcif_bit);
+            }
         }
 
         self.push16(self.pc as u16);
@@ -990,10 +1237,15 @@ impl AvrVm {
     }
 }
 
-fn timer0_compa_vec_for(device: &str) -> u8 {
-    match device {
-        "atmega328" | "atmega328p" => 14,
-        "atmega1284" | "atmega1284p" => 16,
+/// Map a timer clock-select (CS2:0) value to its prescaler divisor, or 0 when
+/// the clock is stopped or driven from an external pin (not modelled).
+fn cs_prescaler(cs: u8) -> u32 {
+    match cs & 0x07 {
+        1 => 1,
+        2 => 8,
+        3 => 64,
+        4 => 256,
+        5 => 1024,
         _ => 0,
     }
 }

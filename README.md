@@ -18,8 +18,12 @@ The decoder implements AVR instruction groups including pointer-based
 loads/stores, the multiply family, program-memory access
 (`LPM`/`ELPM`/`SPM`), indirect jumps/calls, the XMEGA atomic
 read-modify-write instructions, and the XMEGA `DES` round. It also models a
-few peripherals: classic and modern EEPROM access, a Timer0 compare-match
-source, and the ready bits of the SPI/TWI/UART status registers (see §3 and §7).
+number of peripherals: classic and modern EEPROM access; Timer0/Timer1 with
+overflow and output-compare A/B interrupts; the USART-RX, ADC-complete, SPI-STC
+and TWI completion interrupts; external INT0/INT1 and pin-change (PCINT)
+interrupts; and the ready bits of the SPI/TWI/UART status registers (see §3 and §7).
+Timer/interrupt register addresses, vectors and trigger pins are taken per device
+from the toolchain's own data (std register maps + the Microchip ATDF pinouts).
 The SREG (status-flag) semantics of every ALU instruction are checked against
 the AVR Instruction Set Manual by an exhaustive conformance test (see §8).
 
@@ -28,7 +32,7 @@ the AVR Instruction Set Manual by an exhaustive conformance test (see §8).
 | Path | Purpose |
 | :--- | :--- |
 | `src/lib.rs` | Library crate root; re-exports `AvrVm`. |
-| `src/core.rs` | `AvrVm` struct, unified memory map, EEPROM / Timer0 / interrupt logic. |
+| `src/core.rs` | `AvrVm` struct, unified memory map, EEPROM, timer and interrupt logic. |
 | `src/decode.rs` | Instruction decoder and execution engine. |
 | `src/disasm.rs` | Trace disassembler (renders each instruction as text). |
 | `src/devices.rs` | `AvrCoreClass` and the `AVR_DEVICE_TABLE` of device presets. |
@@ -135,8 +139,15 @@ render them; the CLI drains that buffer to stdout for `-t`.
   * **I/O space:** device-dependent window `[0x20, RAMSTART)`, reachable through
     `IN`/`OUT` and the unified data map. SPI/TWI/UART status reads return their
     "ready" bits set so simple polling loops make progress.
-  * **Timer0:** a compare-match (COMPA) source is modeled for the devices that
-    declare its vector, raising the interrupt when enabled.
+  * **Timers & interrupts:** Timer0/Timer1 count at their prescaler and raise
+    overflow / output-compare-A/B interrupts; USART-RX, ADC-complete, SPI-STC and
+    TWI completion interrupts fire from the matching peripheral event; external
+    INT0/INT1 and pin-change (PCINT) interrupts fire from the watched pins. Every
+    source is gated by its enable bit and the global I flag, exactly as on the
+    part, so an interrupt-driven program runs without any host intervention. Per
+    device, the registers/vectors/bits come from the toolchain's own data and the
+    Microchip ATDF files; a self-loop (`RJMP .-2`) with interrupts enabled is
+    treated as an idle wait, not a halt.
   * **Extended addressing:** `RAMPX`, `RAMPY`, `RAMPZ` extend the X/Y/Z
     pointers; `RAMPZ` extends `ELPM`; `EIND` extends `EICALL`/`EIJMP`.
 
@@ -252,13 +263,18 @@ Without `-mmcu`, a generic preset is used.
 The emulator models the **CPU core** plus a small set of peripherals, not a
 complete microcontroller:
 
-1.  **Limited peripherals.** Beyond the modeled EEPROM, Timer0 compare-match,
-    and SPI/TWI/UART status "ready" bits, the I/O space is a plain byte array:
-    there is no full timer/UART/SPI/ADC/port logic.
-2.  **Interrupt controller is generic.** `SEI`, `CLI`, and `RETI` manage the I
-    flag; a pending-vector queue (`--irq`, `--irq-at`, `--irq-every`) plus
-    priority dispatch (lowest vector index first) drives delivery.
-    Peripheral-driven generation is limited to the modeled Timer0 COMPA source.
+1.  **Partial peripherals.** EEPROM, Timer0/Timer1 (overflow + compare A/B),
+    ADC conversion, and the SPI/TWI/UART data paths are modeled, but not every
+    peripheral feature: there is no Timer input-capture / COMPC, no analog
+    comparator, no watchdog timer, and the I/O space outside the modeled
+    registers is a plain byte array.
+2.  **Interrupts: peripheral-driven and manual.** `SEI`, `CLI`, and `RETI`
+    manage the I flag; delivery is priority-dispatched (lowest vector first).
+    The VM auto-raises Timer0/1 overflow & compare-A/B, USART-RX, ADC-complete,
+    SPI-STC, TWI, external INT0/INT1 and pin-change (PCINT) interrupts from their
+    events; the pending-vector queue (`--irq`, `--irq-at`, `--irq-every`) injects
+    any other vector manually. Not yet auto-raised: INT2–7, UART UDRE/TX-complete,
+    timer input-capture, analog-comparator, EE-/SPM-ready, watchdog.
 3.  **`LDS`/`STS` use a 16-bit address.** `RAMPD` is not applied, so extended
     direct addressing only matters on devices with more than 64 KB of data
     space.

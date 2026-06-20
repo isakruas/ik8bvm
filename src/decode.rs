@@ -980,7 +980,13 @@ pub fn step(c: &mut AvrVm) {
             }
             if k == -1 {
                 c.cycles += 1;
-                c.running = false;
+                if c.get_flag(7) {
+                    // Self-loop with interrupts enabled: an idle wait-for-interrupt,
+                    // not a halt. Stay on the RJMP so queued interrupts still fire.
+                    c.pc = add_word_offset(c.pc, k);
+                } else {
+                    c.running = false;
+                }
             } else {
                 c.pc = add_word_offset(c.pc, k);
                 c.cycles += 2;
