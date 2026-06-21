@@ -87,14 +87,19 @@ fn pop8(c: &mut AvrVm) -> u8 {
     c.read_data(c.sp as u32)
 }
 
+// AVR return-address byte order (per the AVR Instruction Set Manual, CALL/RET):
+// the stack grows downward and PUSH post-decrements SP, so pushing the low byte
+// first lands the HIGH byte at the LOWER address. RET reads the high byte from
+// that lower address. Hand-built stack frames (the kernel's @ctx_bootstrap /
+// @swtch) rely on exactly this layout, so the VM must match the silicon.
 fn push16(c: &mut AvrVm, val: u16) {
-    push8(c, (val >> 8) as u8);
     push8(c, (val & 0xFF) as u8);
+    push8(c, (val >> 8) as u8);
 }
 
 fn pop16(c: &mut AvrVm) -> u16 {
-    let lo = pop8(c) as u16;
     let hi = pop8(c) as u16;
+    let lo = pop8(c) as u16;
     (hi << 8) | lo
 }
 
@@ -836,7 +841,8 @@ pub fn step(c: &mut AvrVm) {
                 let nxt = c.flash_word(c.pc) as u32;
                 c.pc += 2;
                 let addr = nxt | (((op & 0x01F0) as u32) << 13) | (((op & 1) as u32) << 16);
-                push16(c, c.pc as u16);
+                // The AVR PC counts program-memory WORDS; push the word address.
+                push16(c, (c.pc / 2) as u16);
                 c.pc = addr * 2;
                 c.cycles += cyc(c, 4, 3, 3, 0);
             } else if op == 0x9409 {
@@ -847,7 +853,7 @@ pub fn step(c: &mut AvrVm) {
             } else if op == 0x9509 {
                 // ICALL
                 let z = (c.r[30] as u32) | ((c.r[31] as u32) << 8);
-                push16(c, c.pc as u16);
+                push16(c, (c.pc / 2) as u16);
                 c.pc = z * 2;
                 c.cycles += cyc(c, 3, 2, 2, 3);
             } else if op == 0x9419 {
@@ -858,16 +864,16 @@ pub fn step(c: &mut AvrVm) {
             } else if op == 0x9519 {
                 // EICALL
                 let z = (c.r[30] as u32) | ((c.r[31] as u32) << 8) | ((c.eind as u32) << 16);
-                push16(c, c.pc as u16);
+                push16(c, (c.pc / 2) as u16);
                 c.pc = z * 2;
                 c.cycles += cyc(c, 4, 3, 3, 0);
             } else if op == 0x9508 {
-                // RET
-                c.pc = pop16(c) as u32;
+                // RET (word address on the stack -> byte PC)
+                c.pc = (pop16(c) as u32) * 2;
                 c.cycles += cyc(c, 4, 4, 4, 6);
             } else if op == 0x9518 {
-                // RETI
-                c.pc = pop16(c) as u32;
+                // RETI (word address on the stack -> byte PC)
+                c.pc = (pop16(c) as u32) * 2;
                 c.set_flag(F_I, true);
                 c.cycles += cyc(c, 4, 4, 4, 6);
             } else if op == 0x95A8 {
@@ -998,7 +1004,7 @@ pub fn step(c: &mut AvrVm) {
             if k & 0x0800 != 0 {
                 k |= -4096;
             }
-            push16(c, c.pc as u16);
+            push16(c, (c.pc / 2) as u16);
             c.pc = add_word_offset(c.pc, k);
             c.cycles += cyc(c, 3, 2, 2, 3);
         }
@@ -1277,7 +1283,10 @@ mod tests {
     }
 
     #[test]
-    fn calls_push_and_pop_byte_return_addresses() {
+    fn calls_push_and_pop_word_return_addresses() {
+        // Real AVR: CALL/RCALL push the return address as a program-memory WORD
+        // address, high byte at the LOWER stack address. Here the return is byte
+        // PC 2 = word 1, so the stack holds 0x00 (high) at sp-1 and 0x01 (low) at sp.
         let mut c = vm(64);
         put_op(&mut c, 0, 0xD001); // RCALL +1 -> byte PC 4
         put_op(&mut c, 4, 0x9508); // RET
@@ -1287,8 +1296,8 @@ mod tests {
 
         assert_eq!(c.pc, 4);
         assert_eq!(c.sp, initial_sp - 2);
-        assert_eq!(c.read_data((initial_sp - 1) as u32), 0x02);
-        assert_eq!(c.read_data(initial_sp as u32), 0x00);
+        assert_eq!(c.read_data((initial_sp - 1) as u32), 0x00); // word-addr high byte (lower address)
+        assert_eq!(c.read_data(initial_sp as u32), 0x01); // word-addr low byte (higher address)
 
         step(&mut c);
 
@@ -1297,7 +1306,8 @@ mod tests {
     }
 
     #[test]
-    fn rcall_negative_offset_pushes_byte_return_address() {
+    fn rcall_negative_offset_pushes_word_return_address() {
+        // Return is byte PC 6 = word 3: 0x00 (high) at sp-1, 0x03 (low) at sp.
         let mut c = vm(64);
         c.pc = 4;
         put_op(&mut c, 4, 0xDFFE); // RCALL -2
@@ -1307,7 +1317,7 @@ mod tests {
 
         assert_eq!(c.pc, 2);
         assert_eq!(c.sp, initial_sp - 2);
-        assert_eq!(c.read_data((initial_sp - 1) as u32), 0x06);
-        assert_eq!(c.read_data(initial_sp as u32), 0x00);
+        assert_eq!(c.read_data((initial_sp - 1) as u32), 0x00); // word-addr high byte (lower address)
+        assert_eq!(c.read_data(initial_sp as u32), 0x03); // word-addr low byte (higher address)
     }
 }

@@ -1205,7 +1205,9 @@ impl AvrVm {
             }
         }
 
-        self.push16(self.pc as u16);
+        // Interrupt entry pushes the return address like CALL: the WORD address
+        // (PC counts program-memory words). RETI pops it back and scales to bytes.
+        self.push16((self.pc / 2) as u16);
         self.pc = vec as u32 * self.vector_slot_bytes();
         self.cycles += 5;
 
@@ -1232,8 +1234,10 @@ impl AvrVm {
     }
 
     fn push16(&mut self, v: u16) {
-        self.push8((v >> 8) as u8);
+        // AVR order: low byte first, so the HIGH byte lands at the lower address
+        // (matches decode::pop16, which RETI uses to restore the PC).
         self.push8((v & 0xFF) as u8);
+        self.push8((v >> 8) as u8);
     }
 }
 
@@ -1363,8 +1367,10 @@ mod tests {
         assert_eq!(c.cycles, 6);
         assert!(!c.get_flag(7));
         assert_eq!(c.sp, initial_sp - 2);
-        assert_eq!(c.read_data((initial_sp - 1) as u32), 0x02);
-        assert_eq!(c.read_data(initial_sp as u32), 0x00);
+        // Return is byte PC 2 = word 1, pushed like CALL: high byte at the lower
+        // stack address (AVR order), low byte at the higher address.
+        assert_eq!(c.read_data((initial_sp - 1) as u32), 0x00); // word-addr high byte
+        assert_eq!(c.read_data(initial_sp as u32), 0x01); // word-addr low byte
     }
 
     #[test]
