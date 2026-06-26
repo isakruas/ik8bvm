@@ -497,6 +497,97 @@ pub fn disassemble_ihex(text: &str) -> String {
     disassemble(&parse_ihex(text))
 }
 
+/// Static control-flow target (absolute byte address) of `op`, if it has one
+/// that is known without execution (RJMP/RCALL/branches/JMP/CALL).
+pub fn branch_target(op: u16, op2: u16, pc: u32) -> Option<u32> {
+    match op & 0xF000 {
+        0xC000 | 0xD000 => Some(rel12(op, pc).1),
+        0xF000 if (op & 0xFC00) == 0xF000 || (op & 0xFC00) == 0xF400 => Some(rel7(op, pc).1),
+        0x9000 if (op & 0xFE0E) == 0x940C || (op & 0xFE0E) == 0x940E => {
+            let word = ((((op >> 4) & 0x1F) as u32) << 17) | (((op & 1) as u32) << 16) | op2 as u32;
+            Some(word * 2)
+        }
+        _ => None,
+    }
+}
+
+/// Disassemble Intel HEX with cross-referenced labels: jump/branch/call targets
+/// become named labels (`L_xxxxxx:`), the leading interrupt-vector jump table is
+/// labelled (`reset:` / `__vector_N:`), and control-flow operands reference those
+/// names instead of bare addresses.
+pub fn disassemble_annotated(text: &str) -> String {
+    use std::collections::BTreeMap;
+    let flash = parse_ihex(text);
+    let used = flash
+        .iter()
+        .rposition(|&b| b != 0)
+        .map(|i| (i / 2) * 2 + 2)
+        .unwrap_or(0);
+    if used == 0 {
+        return "(empty program)\n".to_string();
+    }
+
+    let word = |a: usize| -> u16 {
+        if a + 1 < flash.len() {
+            u16::from_le_bytes([flash[a], flash[a + 1]])
+        } else {
+            0
+        }
+    };
+
+    // Pass 1: collect control-flow targets and the leading vector jump table.
+    let mut targets: BTreeMap<u32, String> = BTreeMap::new();
+    let mut vectors: Vec<u32> = Vec::new();
+    let mut in_vectors = true;
+    let mut a = 0usize;
+    while a + 1 < used {
+        let op = word(a);
+        let words = instr_words(op);
+        if in_vectors {
+            if (op & 0xF000) == 0xC000 || (op & 0xFE0E) == 0x940C {
+                vectors.push(a as u32);
+            } else {
+                in_vectors = false;
+            }
+        }
+        if let Some(t) = branch_target(op, word(a + 2), a as u32) {
+            targets.entry(t).or_insert_with(|| format!("L_{:06X}", t));
+        }
+        a += words * 2;
+    }
+    // Vector labels take precedence over generic ones.
+    for (i, &addr) in vectors.iter().enumerate() {
+        let name = if i == 0 { "reset".to_string() } else { format!("__vector_{}", i) };
+        targets.insert(addr, name);
+    }
+
+    // Pass 2: emit, prefixing label lines and rewriting target operands.
+    let mut out = String::new();
+    let mut a = 0usize;
+    while a + 1 < used {
+        let op = word(a);
+        let op2 = word(a + 2);
+        let words = instr_words(op);
+        if let Some(label) = targets.get(&(a as u32)) {
+            out.push_str(&format!("{}:\n", label));
+        }
+        let (mut text, _, _) = disasm_static(op, op2, a as u32);
+        if let Some(t) = branch_target(op, op2, a as u32) {
+            if let Some(label) = targets.get(&t) {
+                text = text.replace(&format!("0x{:06X}", t), label);
+            }
+        }
+        let cols = if words == 2 {
+            format!("{:04X} {:04X}", op, op2)
+        } else {
+            format!("{:04X}     ", op)
+        };
+        out.push_str(&format!("{:06X}:  {}  {}\n", a, cols, text));
+        a += words * 2;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
